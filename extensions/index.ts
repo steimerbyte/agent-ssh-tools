@@ -437,37 +437,32 @@ function fingerprintFor(keyPath) {
 
 // ---- verify block -----------------------------------------------------
 
-async function buildVerifyBlock(remote, cwd, seconds = 6) {
+async function buildVerifyBlock(target, cwd, seconds = 6) {
+  const remote = target.remote;
+  const profileName = target.name;
   const idFile = identityFileFor(remote);
   const fp     = fingerprintFor(idFile);
   const t = seconds;
-  // Single ssh call with a safe separator. One TCP+auth handshake
-  // instead of three. Use whoami/hostname directly (more portable than
-  // $USER/$HOSTNAME which can be empty in some shells) and run date via
-  // sh -c so $(...) substitution survives ssh-stdin properly.
   const SEP = "@@ssh-cli-verify@@";
-  // Build the command as a single-quoted bash script. SEP must remain
-  // literal in the remote shell so we can split on it. We use the safe
-  // pattern: `'`, value, `'` -> splits a single-quoted string with
-  // `'`\\''` to insert a literal apostrophe. No JS template literal
-  // interpolation touches the SEP marker.
-  //
-  // bash -c over ssh runs without a login shell so PATH may be empty
-  // — set it explicitly. Use `uname -n` for hostname (universal)
-  // rather than `hostname` (missing on minimal distros/WSL).
   const q = (v) => "'" + String(v).replace(/'/g, "'\\''") + "'";
+  // Compare what the user/agent THINKS they are connecting to (ssh-cli
+  // arg, which is `remote`) with what the machine REPORTS (`uname -n`).
+  // A poisonable profile would map `pve-docker` (familiar name) to a
+  // different host; if those two strings disagree, the user/agent
+  // sees a MISMATCH warning.
   const cmd =
     `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ` +
-    `printf '%s\\n' "$(whoami)" ${q(SEP)} "$(uname -n)" ${q(SEP)} "$(date -u +%Y-%m-%dT%H:%M:%SZ)"`;
-  let user = "<error>", hostname = "<error>", date = "<error>";
+    `printf '%s\\n' "$(whoami)" ${q(SEP)} "$(uname -n)" ${q(SEP)} "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ${q(SEP)} "${q(profileName)}"`;
+  let user = "<error>", hostname = "<error>", date = "<error>", aliasEcho = "<error>";
   try {
     const r = await sshExec(remote, cmd, { timeoutSeconds: t });
     if (r.exitCode === 0) {
       const parts = r.stdout.toString("utf8").trim().split(SEP);
-      if (parts.length >= 3) {
+      if (parts.length >= 4) {
         user = parts[0].trim();
         hostname = parts[1].trim();
         date = parts[2].trim();
+        aliasEcho = parts[3].trim();
       }
     } else {
       user = `<ssh-exit-${r.exitCode}>`;
@@ -475,13 +470,21 @@ async function buildVerifyBlock(remote, cwd, seconds = 6) {
   } catch (e: any) {
     user = `<timeout>`;
   }
+  // Mismatch detection: profiles.json or ~/.ssh/config can route a
+  // familiar name (e.g. "pve-docker") to a different host. If the
+  // profile name disagrees with what `uname -n` reports, surface the
+  // warning so the agent/user can spot profile-poisoning.
+  const mismatch = aliasEcho !== "<error>" &&
+                    hostname !== "<error>" &&
+                    aliasEcho !== hostname;
   const lines = [
     "verify:",
     `  user:     ${user}`,
-    `  hostname: ${hostname}`,
+    `  hostname: ${hostname}` + (mismatch ? `  <-- MISMATCH (profile name: ${aliasEcho})` : ""),
     `  cwd:      ${cwd || "(remote default ~)"}`,
-    `  key:      ${fp || "(no identity file)"}`,  // never expose the key path
-    `  date:     ${date}`
+    `  key:      ${fp || "(no identity file)"}`,
+    `  date:     ${date}`,
+    mismatch ? `\n  WARNING: profile name '${aliasEcho}' resolved to '${hostname}'.\n           profiles.json or ~/.ssh/config may be pointing to a different host.` : ""
   ];
   return lines.join("\n");
 }
@@ -785,7 +788,7 @@ function sshToolsExtension(pi) {
     // identity, user, hostname, cwd before the first mutation.
     let verifyBlock = "";
     try {
-      verifyBlock = await buildVerifyBlock(activeTarget.remote, activeTarget.remoteCwd);
+      verifyBlock = await buildVerifyBlock(activeTarget, activeTarget.remoteCwd);
       ctx.ui.notify(verifyBlock, "info");
     } catch (e) {
       verifyBlock = `(verify-block failed: ${e.message})`;
