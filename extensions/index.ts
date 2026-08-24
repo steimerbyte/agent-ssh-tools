@@ -276,9 +276,20 @@ function sshExec(remote, command, options = {}) {
         reject(new Error(`timeout:${options.timeoutSeconds}`));
         return;
       }
+      // Cap output buffers to prevent OOM on commands that produce
+      // 100+ MB (e.g. accidental `cat /var/log/syslog`). When the cap is
+      // hit, the captured buffer stays at the cap and a flag is set
+      // so callers can surface "output truncated" to the user.
+      const outCap = options.maxOutputBytes ?? 10 * 1024 * 1024;
+      let stdout = Buffer.concat(stdoutChunks);
+      let stderr = Buffer.concat(stderrChunks);
+      let truncated = false;
+      if (stdout.length > outCap) { stdout = stdout.subarray(0, outCap); truncated = true; }
+      if (stderr.length > outCap) { stderr = stderr.subarray(0, outCap); truncated = true; }
       resolve({
-        stdout: Buffer.concat(stdoutChunks),
-        stderr: Buffer.concat(stderrChunks),
+        stdout,
+        stderr,
+        truncated,
         exitCode
       });
     });
@@ -303,18 +314,20 @@ async function sshExecVerbose(remote, command, options = {}) {
   let exit = 0;
   let stdout: Buffer = Buffer.alloc(0);
   let stderr: Buffer = Buffer.alloc(0);
+  let truncated = false;
   try {
     const r = await sshExec(remote, command, options);
     exit = r.exitCode;
     stdout = r.stdout;
     stderr = r.stderr;
+    truncated = (r as any).truncated === true;
   } catch (e: any) {
     exit = 124;
     stderr = Buffer.from(String(e?.message ?? e));
   }
   const elapsed = Date.now() - t0;
   const header = formatSshHeader(remote, command, exit, elapsed, stderr.toString("utf8").trim());
-  return { exit, stdout, stderr, elapsedMs: elapsed, header };
+  return { exit, stdout, stderr, elapsedMs: elapsed, truncated, header };
 }
 
 async function sshOk(remote, command, options = {}) {
@@ -1046,6 +1059,7 @@ function sshToolsExtension(pi) {
       const parts: string[] = [];
       if (r.stdout.length) parts.push(r.stdout.toString("utf8").trimEnd());
       if (r.stderr.length && r.exit !== 0) parts.push(`[stderr]\n${r.stderr.toString("utf8").trimEnd()}`);
+      if (r.truncated) parts.push(`[output truncated — exceeds 10MB cap]`);
       return {
         content: [{ type: "text", text: parts.join("\n\n") }],
         details: {
@@ -1053,7 +1067,8 @@ function sshToolsExtension(pi) {
           elapsedMs: elapsed,
           cwd,
           host: target.remote,
-          cmd
+          cmd,
+          truncated: r.truncated
         }
       };
     },
