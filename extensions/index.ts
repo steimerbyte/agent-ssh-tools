@@ -100,11 +100,17 @@ function refreshProfiles() {
 //   1. profiles.json aliases[arg]
 //   2. profiles.json profiles[arg] (custom host + cwd)
 //   3. ~/.ssh/config Host block
-//   4. raw arg as fallback
+//   4. raw arg as fallback (marked `untrusted: true`)
+//
 // Inline ":path" syntax sets an inline cwd that always wins.
+//
+// `untrusted: true` means the name did not match any configured source.
+// Callers should refuse to probe in that state — passing arbitrary
+// strings to ssh(1) would let a typo or prompt-injection turn into
+// a connection attempt to the wrong host.
 function normalizeTargetArg(arg) {
   const trimmed = (arg || "").trim();
-  if (!trimmed) return { name: "", remote: "", cwd: undefined };
+  if (!trimmed) return { name: "", remote: "", cwd: undefined, untrusted: true, error: "empty target" };
 
   const data = readProfiles();
   const aliases  = data.aliases  || {};
@@ -132,11 +138,39 @@ function normalizeTargetArg(arg) {
     remote = prof.host || resolved;
     cwd    = inlineCwd || prof.cwd;
   } else {
-    remote = resolved;
-    cwd    = inlineCwd;
+    // No profile, no alias, no ssh-config Host block. Do NOT silently
+    // pass this through to ssh(1) — the user probably mistyped or the
+    // model invented a name. Caller must reject via `untrusted: true`.
+    return {
+      name: resolved,
+      remote: resolved,
+      cwd: inlineCwd,
+      untrusted: true,
+      error: `target '${trimmed}' not found in profiles, aliases, or ~/.ssh/config`,
+    };
   }
 
-  return { name: resolved, remote, cwd };
+  return { name: resolved, remote, cwd, untrusted: false };
+}
+
+// Human-readable list of available targets for error messages.
+function sshCliAvailableTargets(): string {
+  const data = readProfiles();
+  const profNames = Object.keys(data.profiles || {});
+  const sshHosts = parseSshConfigProfiles().map(p => p.name);
+  const aliasNames = Object.keys(data.aliases || {});
+  // profile names first, then alias->target, then ssh-config hosts not already covered
+  const out: string[] = [...profNames];
+  for (const [alias, target] of Object.entries(data.aliases || {})) {
+    out.push(`${alias} -> ${target}`);
+  }
+  for (const h of sshHosts) {
+    if (!profNames.includes(h)) out.push(h);
+  }
+  if (aliasNames.length === 0 && profNames.length === 0 && sshHosts.length === 0) {
+    return "(none configured)";
+  }
+  return out.join(", ");
 }
 
 // ---- ssh wrappers -----------------------------------------------------
@@ -598,8 +632,20 @@ function sshToolsExtension(pi) {
       const profile = normalizeTargetArg(arg);
       if (!profile.remote) {
         return {
-          content: [{ type: "text", text: `ssh_target_select: cannot resolve target '${arg}'` }],
-          details: { ok: false, reason: "bad-args" }
+          content: [{ type: "text", text: `ssh_target_select: ${profile.error || "cannot resolve target"}` }],
+          details: { ok: false, reason: "bad-args", error: profile.error }
+        };
+      }
+      if (profile.untrusted) {
+        // Name did not match profiles, aliases, or ~/.ssh/config.
+        // Refuse to probe — a mistyped name like "current" must not
+        // result in a connection attempt to an arbitrary host.
+        const msg = profile.error
+          || `target '${arg}' not found in profiles, aliases, or ~/.ssh/config`;
+        ctx.ui.notify(`ssh_target_select: ${msg}`, "warning");
+        return {
+          content: [{ type: "text", text: `ssh_target_select: ${msg}\n\nAvailable targets: ${sshCliAvailableTargets()}` }],
+          details: { ok: false, reason: "unknown-target", error: msg }
         };
       }
 
@@ -779,7 +825,12 @@ function sshToolsExtension(pi) {
       // target in one step (probe + verify runs as part of activate).
       // Equivalent to bare /sshactivate followed by ssh_target_select.
       if (input) {
-        await activate(normalizeTargetArg(input), ctx);
+        const profile = normalizeTargetArg(input);
+        if (profile.untrusted) {
+          ctx.ui.notify(`sshactivate: ${profile.error}\nAvailable: ${sshCliAvailableTargets()}`, "warning");
+          return;
+        }
+        await activate(profile, ctx);
         return;
       }
 
