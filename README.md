@@ -1,58 +1,65 @@
-# ssh-cli-pi
+# agent-ssh-tools
 
-Pi coding-agent SSH extension — drop-in replacement for `pi-ssh-tools` with
-hardened connection semantics and explicit agent safety checks.
+A Pi coding-agent SSH extension for the agent era. Profile manager +
+verified activation + read/write/edit/exec tools with safety hardening
+designed to keep AI agents from running mutations on the wrong host with
+the wrong identity.
 
 ## Install
 
 ```sh
-pi install npm:@ogulcancelik/ssh-cli-pi
+pi install npm:@ogulcancelik/agent-ssh-tools
 ```
 
-Or, if you have the original plugin installed, remove it first:
+The plugin activates four tools and one slash command:
 
-```sh
-pi remove pi-ssh-tools  # exact name may vary in your install
-pi install npm:@ogulcancelik/ssh-cli-pi
-```
-
-The plugin activates four tools:
-
-| Tool | Purpose |
-|------|---------|
+| Tool / Command | Purpose |
+|----------------|---------|
 | `ssh_read` | Read a file on the active remote |
 | `ssh_write` | Write a file on the active remote |
-| `ssh_edit` | Edit a file with exact text replacement |
+| `ssh_edit` | Edit a file with exact text replacement (SHA-256 unchanged-detection) |
 | `ssh_bash` | Run a shell command on the active remote |
-
-And one slash command:
-
-| Command | Purpose |
-|---------|---------|
-| `/ssh` | Toggle SSH mode interactively |
-| `/ssh <name[:/path]>` | Activate a target |
+| `/ssh <name[:/path]>` | Activate a target with probe + verify |
 | `/ssh off` | Deactivate |
 | `/ssh status` | Show current target |
 
-## What changed vs. the original pi-ssh-tools
+---
+
+## What this extension adds on top of a basic SSH plugin
+
+A bare-bones SSH plugin lets an agent run commands on remote hosts. That is
+not enough when the agent is acting autonomously — it might activate the
+wrong Host block, edit the wrong file, or silently fail and then assume
+success. This extension bakes in seven guard-rails so the agent is forced
+to confirm it is on the right system before any mutation lands.
 
 ### 1. Probe-before-activate
 
-`/ssh <host>` runs a TCP-connect to port 22 and an `ssh BatchMode whoami`
-before any state changes. If the host is unreachable, refuses, times out, or
-fails authentication, the agent sees a categorized error:
+`/ssh <host>` runs two checks before changing any state:
 
-```
-SSH mode NOT activated: host unreachable (192.0.2.1) — no TCP response on 192.0.2.1:22 within 6s
-```
+1. **TCP-connect** to port 22 with a 6-second timeout.
+2. **`ssh BatchMode whoami`** to confirm the SSH banner exchange and
+   authentication both succeed.
 
-`activeTarget` stays `null` and the four SSH tools remain disabled. **No more
-"silent activation with broken connection"** — the agent will fail loudly on
-the first tool call instead of confusing the user.
+Failures are categorized so the agent (and the user) can tell what went
+wrong:
+
+| Reason | Meaning |
+|--------|---------|
+| `unreachable` | No TCP response on port 22 (no route, host down, firewall) |
+| `refused` | TCP reached the host but nothing is listening on 22 |
+| `auth` | SSH handshake worked but authentication failed |
+| `timeout` | The connection took longer than the bound |
+| `ssh-error` | ssh(1) reported some other failure |
+| `ssh-missing` | No `ssh` binary on PATH |
+
+`activeTarget` stays `null` on any failure and the four `ssh_*` tools stay
+disabled. The agent cannot accidentally run a command on a target it never
+properly connected to.
 
 ### 2. Verify block after activation
 
-After successful activation the plugin prints:
+After a successful activation the plugin prints:
 
 ```
 verify:
@@ -63,94 +70,103 @@ verify:
   date:     2026-08-24T16:54:28Z
 ```
 
-Agents must read this and confirm user/hostname/cwd/key match expectations
-before any mutation. The key fingerprint comes from `ssh-keygen -lf` on the
-IdentityFile that `ssh -G <host>` would use, so a mismatch here means the
-agent is using the wrong key — common when `~/.ssh/config` has multiple Host
-blocks with similar names.
+This block is the agent's only chance to notice a mistake before the first
+mutation. Each field exists because each one has burned someone in the past:
 
-### 3. Inline cwd always wins
+| Field | What the agent must verify |
+|-------|----------------------------|
+| `user` | Is this the user the task assumes? Wrong user = wrong permissions. |
+| `hostname` | Is this the host the task targets? Mixing `web01` and `web02` is the most common mistake. |
+| `cwd` | Is this where the user expects the operation to land? |
+| `key` | Does the fingerprint match the identity you expect? Surprising key = wrong `~/.ssh/config` Host block. |
+| `date` | Is the remote clock roughly now? Stale date = possible MITM or wrong network. |
 
-`/ssh web01:/var/log` overrides any profile-stored cwd for this session.
-This also matches the same syntax used by `ssh(1)` and avoids the trap of
-"profile.cwd says `/var/www` but I needed `/var/log`".
+The key fingerprint comes from `ssh-keygen -lf` on the IdentityFile that
+`ssh -G <host>` would actually use, so a mismatch here means the agent
+is using a different SSH key than expected — common when `~/.ssh/config`
+has multiple Host blocks with similar names that resolve to the same IP.
 
-### 4. profiles.json with aliases
+### 3. Profile + alias resolver
 
-Define reusable targets and short names:
+Define reusable targets and short names in
+`~/.config/agent-ssh-tools/profiles.json`:
 
 ```json
 {
   "profiles": {
-    "web01":  { "host": "web01.example.com", "cwd": "/var/www" },
-    "prod-db":{ "host": "postgres.internal",  "cwd": "/etc/postgresql" }
+    "web01":   { "host": "web01.example.com", "cwd": "/var/www" },
+    "prod-db": { "host": "postgres.internal",  "cwd": "/etc/postgresql" }
   },
   "aliases": {
-    "prod":   "web01",
-    "stage":  "web01-staging:/opt/app",
-    "pg":     "prod-db"
+    "prod":  "web01",
+    "stage": "web01-staging:/opt/app",
+    "pg":    "prod-db"
   }
 }
 ```
 
-File: `~/.config/ssh-cli-pi/profiles.json`. Aliases and explicit profile names
-are auto-completed by `/ssh`. Inline cwd in aliases is preserved.
+Hosts from `~/.ssh/config` are auto-discovered (wildcards `*` / `?` and
+negations `!` skipped) and appear in `/ssh` completion unless a profile
+with the same name is defined.
+
+Resolution order:
+1. `aliases[arg]`
+2. `profiles[arg]` (uses `host`, `cwd` from the profile)
+3. `~/.ssh/config` `Host <arg>` block
+4. Raw `<arg>` passed to ssh(1) as a fallback
+
+### 4. Inline cwd via `name:/path` syntax
+
+`/ssh web01:/etc/nginx` overrides any stored cwd for this session. The
+inline path always wins. Aliases can also embed an inline path:
+`stage: web01-staging:/opt/app` opens the connection as `web01-staging`
+but starts the agent in `/opt/app` on the remote.
 
 ### 5. SHA-256 unchanged-detection in `ssh_edit`
 
-Before pushing, the plugin compares SHA-256 of the post-edit content with the
-pre-pull SHA-256. Equal → no push. Avoids spurious writes when an `edits[]`
-entry didn't match anything (which already would have been a no-op in the edit
-tool) and lets agents re-run an edit safely without state churn.
+Before pushing, the plugin compares SHA-256 of the post-edit content with
+the pre-pull SHA-256. **Equal → no push.** Two benefits:
+- An `edits[]` entry that didn't match anything is a no-op even at the
+  remote layer (no spurious mtime change).
+- The agent can re-run the same edit safely without churn.
 
-### 6. Bounded ssh timeouts
+The pull-edit-push flow uses a local tmp file in `os.tmpdir()` so the
+remote file is only written when the edit actually changed something.
 
-`sshExec()` accepts `timeoutSeconds` and kills the child with `SIGKILL` on
-expiry. The default for all file operations is 30 seconds. The probe uses a
-6-second ConnectTimeout so a slow network doesn't freeze the agent.
+### 6. Bounded sshExec timeouts
 
-### 7. Relative-path resolution against remote cwd
+`sshExec(remote, command, { timeoutSeconds })` spawns ssh with
+`-o ConnectTimeout=N` and additionally kills the child with `SIGKILL`
+if it has not exited by `timeoutSeconds`. The default is **30 seconds for
+file operations** and **6 seconds for the probe**, so a slow network
+never freezes the agent.
 
-`ssh_read`, `ssh_write`, `ssh_edit` now map relative paths against the
-active **remote** cwd instead of the local process cwd. This matches the
-intuition ("I said `nginx.conf`, I meant `nginx.conf` on the remote, in the
-active dir").
+### 7. Relative paths resolve against remote cwd
+
+`ssh_read web01 nginx.conf`, `ssh_write web01 site.conf`, and
+`ssh_edit web01 site.conf` resolve relative paths against the **active
+remote cwd**, not the local process cwd. Matches the intuition: "I said
+`nginx.conf`, I meant `nginx.conf` on the remote, in the active dir".
+
+---
 
 ## Config
 
 | File | Purpose |
 |------|---------|
-| `~/.config/ssh-cli-pi/profiles.json` | profiles + aliases |
+| `~/.config/agent-ssh-tools/profiles.json` | profiles + aliases |
 | `~/.ssh/config` | auto-discovered hosts (read-only) |
 
-## Resolution order
+## Inspiration
 
-```
-/ssh <arg>
-     │
-     ▼
- ┌─────────────────┐
- │ aliases[arg]?   │──yes──► use, optionally with inline :/path
- └────────┬────────┘
-          │ no
-          ▼
- ┌─────────────────┐
- │ profiles[arg]?  │──yes──► use profile.host, optional profile.cwd
- └────────┬────────┘
-          │ no
-          ▼
- ┌─────────────────┐
- │ ~/.ssh/config   │──yes──► use as raw ssh target
- │  Host arg       │
- └────────┬────────┘
-          │ no
-          ▼
- ┌─────────────────┐
- │ raw arg → ssh   │──always──► may fail at ssh(1)
- └─────────────────┘
-```
-
-Inline `:path` after any of the above always overrides the resulting cwd.
+This extension was inspired by the original `pi-ssh-tools` plugin (the
+four-tool pattern of `ssh_read`/`ssh_write`/`ssh_edit`/`ssh_bash` plus
+the `/ssh` activation command comes from there). The agent-safety layer
+— probe-before-activate, verify block, SHA-256 unchanged-detection —
+was added because real AI agents routinely mis-target hosts, mis-name
+files, and re-run edits without realizing the first run already
+succeeded. None of that is a critique of the original; the safety layer
+is meant to be added on top of any working SSH plugin.
 
 ## License
 

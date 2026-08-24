@@ -1,7 +1,7 @@
 {
-  "name": "@ogulcancelik/ssh-cli-pi",
+  "name": "@ogulcancelik/agent-ssh-tools",
   "version": "0.2.0",
-  "description": "Pi coding-agent SSH extension: profiles, verified activation, timeouts, SHA-256 unchanged-detection. Drop-in replacement for pi-ssh-tools with hardened connection semantics.",
+  "description": "Pi coding-agent SSH extension with agent-safety features: probe-before-activate, verify-block, SHA-256 unchanged-detection, profile+alias resolver.",
   "keywords": [
     "pi",
     "pi-extension",
@@ -28,16 +28,11 @@
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },
-  "author": {
-    "name": "Can Celik",
-    "email": "ogulcancelik@gmail.com",
-    "url": "https://github.com/ogulcancelik"
-  },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/steimerbyte/ssh-cli-pi.git"
+    "url": "git+https://github.com/steimerbyte/agent-ssh-tools.git"
   },
   "bugs": {
-    "url": "https://github.com/steimerbyte/ssh-cli-pi/issues"
+    "url": "https://github.com/steimerbyte/agent-ssh-tools/issues"
   }
 }

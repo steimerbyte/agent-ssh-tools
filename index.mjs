@@ -1,15 +1,8 @@
-// ssh-cli-pi — Pi coding-agent extension
-// SSH profile manager + read/write/edit/exec tools with safety features.
-//
-// Derived from the original pi-ssh-tools plugin; adds:
-//   - verify-block after /ssh activation (user/hostname/cwd/key/date)
-//   - probe-before-activate with categorized connection errors
-//   - relative-path resolution against remote cwd (was local cwd)
-//   - inline cwd via /ssh name:/path wins over profile.cwd
-//   - profiles.json with aliases, host, and cwd overrides
-//   - sshExec timeout via kill('SIGKILL')
-//   - SHA256 unchanged-detection in ssh_edit (skip push if no diff)
-//   - host-key fingerprint lookup for verify block
+// agent-ssh-tools — Pi coding-agent extension
+// SSH profile manager + read/write/edit/exec tools with agent-safety
+// hardening. Inspired by the original pi-ssh-tools plugin; adds probe-
+// before-activate, verify-block, profile+alias resolver, timeouts, and
+// SHA-256 unchanged-detection. See README for the full feature list.
 
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -31,7 +24,7 @@ var _piTui = await jitiImport("@earendil-works/pi-tui");
 const SSH_STATUS_KEY = "ssh-tools";
 const SSH_TOOL_NAMES = ["ssh_read", "ssh_write", "ssh_edit", "ssh_bash"];
 const SSH_CONFIG_PATH = _nodePath.join(_nodeOs.homedir(), ".ssh", "config");
-const PROFILES_FILE = _nodePath.join(_nodeOs.homedir(), ".config", "ssh-cli-pi", "profiles.json");
+const PROFILES_FILE = _nodePath.join(_nodeOs.homedir(), ".config", "agent-ssh-tools", "profiles.json");
 const DEFAULT_PROBE_SECONDS = 6;
 const DEFAULT_SSH_TIMEOUT_SECONDS = 30;
 
@@ -441,7 +434,7 @@ async function execSshEdit(editBase, pi, target, localCwd, params) {
 
   // Apply edits via the edit tool against a virtual local file. Use the
   // standard tool so the same edits[] schema works.
-  const tmpFile = _nodePath.join(_nodeOs.tmpdir(), `ssh-cli-pi-edit-${process.pid}-${Date.now()}.txt`);
+  const tmpFile = _nodePath.join(_nodeOs.tmpdir(), `agent-ssh-tools-edit-${process.pid}-${Date.now()}.txt`);
   _nodeFs.writeFileSync(tmpFile, original);
 
   const transformedParams = {
@@ -701,7 +694,7 @@ function sshToolsExtension(pi) {
       if (!input) {
         const { merged } = refreshProfiles();
         if (merged.length === 0) {
-          ctx.ui.notify("No SSH hosts found. Use /ssh <host>[:/path] or add a profile to ~/.config/ssh-cli-pi/profiles.json", "warning");
+          ctx.ui.notify("No SSH hosts found. Use /ssh <host>[:/path] or add a profile to ~/.config/agent-ssh-tools/profiles.json", "warning");
           return;
         }
         const items = [...(activeTarget ? ["off"] : []), ...merged.map(p => p.name)];
@@ -739,4 +732,4 @@ function sshToolsExtension(pi) {
     };
   });
 }
-/* v2-original+features */
+/* agent-ssh-tools v0.2.0 */
