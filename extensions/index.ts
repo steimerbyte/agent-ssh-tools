@@ -175,6 +175,8 @@ function sshCliAvailableTargets(): string {
 
 // ---- ssh wrappers -----------------------------------------------------
 
+// sshExec: existing core wrapper. Keeps stdout/stderr separate; tools
+// can build their own verbose headers from these primitives.
 function sshExec(remote, command, options = {}) {
   return new Promise((resolve, reject) => {
     const args = [];
@@ -200,6 +202,12 @@ function sshExec(remote, command, options = {}) {
 
     child.stdout.on("data", d => { stdoutChunks.push(d); options.onStdoutData?.(d); });
     child.stderr.on("data", d => { stderrChunks.push(d); options.onStderrData?.(d); });
+    if (options.stdin !== undefined) {
+      child.stdin.write(options.stdin);
+      child.stdin.end();
+    } else {
+      child.stdin.end();
+    }
     child.on("error", err => {
       if (killTimer) clearTimeout(killTimer);
       reject(err);
@@ -217,6 +225,38 @@ function sshExec(remote, command, options = {}) {
       });
     });
   });
+}
+
+// Format a one-line verbose header that prefixes every ssh_* tool result.
+// Shows target host, command, exit code, ms, stderr-summary.
+//   $ ssh pve-docker 'whoami'   exit=0  546ms
+function formatSshHeader(remote, command, exitCode, elapsedMs, stderrText) {
+  const cmdShort = command.length > 80 ? command.slice(0, 77) + "..." : command;
+  const errShort = stderrText ? stderrText.split("\n")[0].slice(0, 60) : "";
+  let line = `$ ssh ${remote} ${JSON.stringify(cmdShort)}  exit=${exitCode}  ${elapsedMs}ms`;
+  if (errShort) line += `\n  stderr: ${errShort}`;
+  return line;
+}
+
+// Run an ssh command, return a verbose envelope the tools can prepend
+// to their content blocks. Always non-throwing; tools inspect `exit`/`stderr`.
+async function sshExecVerbose(remote, command, options = {}) {
+  const t0 = Date.now();
+  let exit = 0;
+  let stdout: Buffer = Buffer.alloc(0);
+  let stderr: Buffer = Buffer.alloc(0);
+  try {
+    const r = await sshExec(remote, command, options);
+    exit = r.exitCode;
+    stdout = r.stdout;
+    stderr = r.stderr;
+  } catch (e: any) {
+    exit = 124;
+    stderr = Buffer.from(String(e?.message ?? e));
+  }
+  const elapsed = Date.now() - t0;
+  const header = formatSshHeader(remote, command, exit, elapsed, stderr.toString("utf8").trim());
+  return { exit, stdout, stderr, elapsedMs: elapsed, header };
 }
 
 async function sshOk(remote, command, options = {}) {
@@ -685,13 +725,21 @@ function sshToolsExtension(pi) {
     parameters: readBase.parameters,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const target = requireActiveTarget();
-      // Map relative path against remote cwd.
       const abs = _nodePath.isAbsolute(params.path)
         ? params.path
         : joinRemote(target.remoteCwd, params.path);
-      const transformed = { ...params, path: abs };
-      const tool = _piCodingAgent.createReadToolDefinition(target.remoteCwd, { operations: createRemoteReadOps(target) });
-      return tool.execute(toolCallId, transformed, signal, onUpdate, ctx);
+      const cmd = `cat -- ${shellQuote(abs)}`;
+      const r = await sshExecVerbose(target.remote, cmd, { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS });
+      const parts = [r.header];
+      if (r.exit === 0) {
+        parts.push(r.stdout.toString("utf8"));
+      } else {
+        parts.push(`[read failed]\n${r.stderr.toString("utf8").trimEnd() || "(no stderr)"}`);
+      }
+      return {
+        content: [{ type: "text", text: parts.join("\n\n") }],
+        details: { exit: r.exit, elapsedMs: r.elapsedMs, path: abs, host: target.remote }
+      };
     },
     renderCall(args, theme) {
       const path = typeof args?.path === "string" ? args.path : "...";
@@ -701,7 +749,10 @@ function sshToolsExtension(pi) {
         0, 0
       );
     },
-    renderResult: readBase.renderResult
+    renderResult(result, theme) {
+      const text = result?.content?.[0]?.text || "";
+      return new _piTui.Text(text, 0, 0);
+    }
   });
 
   pi.registerTool({
@@ -716,9 +767,21 @@ function sshToolsExtension(pi) {
       const abs = _nodePath.isAbsolute(params.path)
         ? params.path
         : joinRemote(target.remoteCwd, params.path);
-      const transformed = { ...params, path: abs };
-      const tool = _piCodingAgent.createWriteToolDefinition(target.remoteCwd, { operations: createRemoteWriteOps(target) });
-      return tool.execute(toolCallId, transformed, signal, onUpdate, ctx);
+      const dir = abs.split("/").slice(0, -1).join("/") || "/";
+      const content = typeof params.content === "string" ? params.content : "";
+      const size = Buffer.byteLength(content, "utf8");
+      const cmd = `mkdir -p -- ${shellQuote(dir)} && base64 -d > ${shellQuote(abs)}`;
+      const r = await sshExecVerbose(target.remote, cmd, { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS, stdin: Buffer.from(content, "utf8").toString("base64") } as any);
+      const parts = [r.header];
+      if (r.exit === 0) {
+        parts.push(`wrote ${size} bytes to ${abs}`);
+      } else {
+        parts.push(`[write failed]\n${r.stderr.toString("utf8").trimEnd() || "(no stderr)"}`);
+      }
+      return {
+        content: [{ type: "text", text: parts.join("\n\n") }],
+        details: { exit: r.exit, elapsedMs: r.elapsedMs, bytes: size, path: abs, host: target.remote }
+      };
     },
     renderCall(args, theme) {
       const path = typeof args?.path === "string" ? args.path : "...";
@@ -728,7 +791,10 @@ function sshToolsExtension(pi) {
         0, 0
       );
     },
-    renderResult: writeBase.renderResult
+    renderResult(result, theme) {
+      const text = result?.content?.[0]?.text || "";
+      return new _piTui.Text(text, 0, 0);
+    }
   });
 
   pi.registerTool({
@@ -767,8 +833,17 @@ function sshToolsExtension(pi) {
     parameters: bashBase.parameters,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const target = requireActiveTarget();
-      const tool = _piCodingAgent.createBashToolDefinition(target.remoteCwd, { operations: createRemoteBashOps(target) });
-      return tool.execute(toolCallId, params, signal, onUpdate, ctx);
+      const cwd = target.remoteCwd;
+      const cmd = params.command;
+      const fullCmd = cwd ? `cd ${shellQuote(cwd)} && ${cmd}` : cmd;
+      const r = await sshExecVerbose(target.remote, fullCmd, { timeoutSeconds: params.timeout ?? 60 });
+      const parts = [r.header];
+      if (r.stdout.length) parts.push(r.stdout.toString("utf8").trimEnd());
+      if (r.stderr.length && r.exit !== 0) parts.push(`[stderr]\n${r.stderr.toString("utf8").trimEnd()}`);
+      return {
+        content: [{ type: "text", text: parts.join("\n\n") }],
+        details: { exit: r.exit, elapsedMs: r.elapsedMs, cwd, host: target.remote }
+      };
     },
     renderCall(args, theme, context) {
       const command = typeof args?.command === "string" ? args.command : "...";
@@ -779,7 +854,10 @@ function sshToolsExtension(pi) {
       );
       return text;
     },
-    renderResult: bashBase.renderResult
+    renderResult(result, theme) {
+      const text = result?.content?.[0]?.text || "";
+      return new _piTui.Text(text, 0, 0);
+    }
   });
 
   // ---- /sshactivate command -------------------------------------------
