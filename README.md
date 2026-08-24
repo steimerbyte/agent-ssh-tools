@@ -27,28 +27,44 @@ The plugin registers five tools and one slash command:
 ## Workflow
 
 ```
-user types /sshactivate web01
+user types /sshactivate                (grant permission — no host chosen)
      │
      ▼
-plugin runs probe (TCP-connect + ssh BatchMode whoami)
+plugin enables ssh_* tools
+activeTarget stays null
      │
-     ├── fail ──► categorized error, no state change
+     ▼
+agent calls ssh_target_select web01   (probe + verify + set)
+     │
+     ├── fail ──► categorized error, ssh_* tools still enabled
+     │            agent can try a different host
      │
      └── ok ───► activeTarget set, verify block printed
                  │
                  ▼
-         ssh_* tools enabled for the agent
+       agent calls ssh_read / ssh_write / ssh_edit / ssh_bash
                  │
                  ▼
-   agent calls ssh_read / ssh_write / ssh_edit / ssh_bash directly
-                 │
-                 ▼
-   agent calls ssh_target_select <other-host> to switch mid-task
+       agent calls ssh_target_select web02 to switch mid-task
 ```
 
 The slash command and the agent-callable tool use **the same `activate()`**
 helper internally, so behavior is identical: same probe, same verify
 block, same error categorization.
+
+`/sshactivate <host>` is a convenience shortcut that combines the bare
+`/sshactivate` + `ssh_target_select <host>` in one step. Use it when the
+user already knows the host; use bare `/sshactivate` when the agent
+should pick.
+
+### Why the split?
+
+`/sshactivate` is the user's **permission** to allow remote operations.
+`ssh_target_select` is the agent's **choice** of which host to operate
+on, with probe + verify to catch mistakes. Combining the two would mean
+the user has to commit to a host at the moment of permission; separating
+them lets the user say "yes, you may work remotely" and let the agent
+choose the right target based on the task.
 
 ---
 
@@ -62,8 +78,8 @@ to confirm it is on the right system before any mutation lands.
 
 ### 1. Probe-before-activate
 
-`/sshactivate <host>` and `ssh_target_select <host>` both run two checks
-before changing any state:
+`ssh_target_select <host>` (and the convenience shortcut
+`/sshactivate <host>`) run two checks before changing any state:
 
 1. **TCP-connect** to port 22 with a 6-second timeout.
 2. **`ssh BatchMode whoami`** to confirm the SSH banner exchange and
@@ -145,8 +161,9 @@ Resolution order:
 
 ### 4. Inline cwd via `name:/path` syntax
 
-`/sshactivate web01:/etc/nginx` (or `ssh_target_select web01:/etc/nginx`)
-overrides any stored cwd for this session. The inline path always wins.
+`/sshactivate web01:/etc/nginx` (convenience form) or
+`ssh_target_select web01:/etc/nginx` (agent-callable tool) override any
+stored cwd for this session. The inline path always wins.
 Aliases can also embed an inline path: `stage: web01-staging:/opt/app`
 opens the connection as `web01-staging` but starts the agent in `/opt/app`
 on the remote.

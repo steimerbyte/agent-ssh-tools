@@ -479,7 +479,7 @@ function sshToolsExtension(pi) {
 
   const requireActiveTarget = () => {
     if (!activeTarget) {
-      throw new Error("SSH mode is off. Use /ssh <host> first.");
+      throw new Error("No active SSH target. SSH tools are enabled — call ssh_target_select <host> first.");
     }
     return activeTarget;
   };
@@ -742,13 +742,16 @@ function sshToolsExtension(pi) {
 
   // ---- /sshactivate command -------------------------------------------
 
-  // Single entry point for the user. After typing `/sshactivate web01`
-  // (or selecting from the picker), the target is set, the four file/cmd
-  // tools become available, and the agent can use them via its own
-  // tool-call layer — including `ssh_target_select` to switch later.
+  // The slash command is the user's grant of permission for the agent to
+  // perform remote operations. It does NOT select a target — that is the
+  // agent's job via `ssh_target_select` (which probes + verifies before
+  // committing). With no argument the command only enables the ssh_*
+  // tools; with a target argument it is a convenience shortcut that
+  // enables tools AND sets the target (equivalent to /sshactivate +
+  // ssh_target_select).
 
   pi.registerCommand("sshactivate", {
-    description: "Activate an SSH target: /sshactivate, /sshactivate <host>[:/path], /sshactivate off, /sshactivate status",
+    description: "Enable SSH tools (no target preselected): /sshactivate, /sshactivate <host>[:/path], /sshactivate off, /sshactivate status",
     getArgumentCompletions: prefix => {
       const { merged } = refreshProfiles();
       const options = ["off", "status", ...merged.map(p => p.name)];
@@ -760,7 +763,7 @@ function sshToolsExtension(pi) {
 
       if (input === "status") {
         if (!activeTarget) {
-          ctx.ui.notify("SSH mode is off", "info");
+          ctx.ui.notify("SSH tools enabled. No target selected yet — agent must call ssh_target_select.", "info");
           return;
         }
         ctx.ui.notify(`SSH mode: ${activeTarget.name} (${activeTarget.remote}:${activeTarget.remoteCwd})`, "info");
@@ -776,21 +779,20 @@ function sshToolsExtension(pi) {
         return;
       }
 
-      if (!input) {
-        const { merged } = refreshProfiles();
-        if (merged.length === 0) {
-          ctx.ui.notify("No SSH hosts found. Use /sshactivate <host>[:/path] or add a profile to ~/.config/agent-ssh-tools/profiles.json", "warning");
-          return;
-        }
-        const items = [...(activeTarget ? ["off"] : []), ...merged.map(p => p.name)];
-        const picked = await ctx.ui.select("SSH target", items);
-        if (!picked) return;
-        if (picked === "off") { deactivate(ctx); return; }
-        await activate(normalizeTargetArg(picked), ctx);
+      // Convenience form: /sshactivate <host> enables tools AND sets the
+      // target in one step (probe + verify runs as part of activate).
+      // Equivalent to bare /sshactivate followed by ssh_target_select.
+      if (input) {
+        await activate(normalizeTargetArg(input), ctx);
         return;
       }
 
-      await activate(normalizeTargetArg(input), ctx);
+      // Default form: /sshactivate with no argument enables the ssh_*
+      // tools so the agent can call ssh_target_select to pick the host.
+      // No probe runs — the agent chooses the target.
+      enableSshTools();
+      ctx.ui.setStatus(SSH_STATUS_KEY, ctx.ui.theme.fg("muted", "SSH (no target — agent picks)"));
+      ctx.ui.notify("SSH tools enabled. The agent will pick the target via ssh_target_select.", "info");
     }
   });
 
@@ -817,4 +819,4 @@ function sshToolsExtension(pi) {
     };
   });
 }
-/* agent-ssh-tools v0.2.0 */
+/* agent-ssh-tools v0.3.0 */
