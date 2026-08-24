@@ -22,7 +22,7 @@ var _piTui = await jitiImport("@earendil-works/pi-tui");
 // ---- constants ---------------------------------------------------------
 
 const SSH_STATUS_KEY = "ssh-tools";
-const SSH_TOOL_NAMES = ["ssh_read", "ssh_write", "ssh_edit", "ssh_bash"];
+const SSH_TOOL_NAMES = ["ssh_target_select", "ssh_read", "ssh_write", "ssh_edit", "ssh_bash"];
 const SSH_CONFIG_PATH = _nodePath.join(_nodeOs.homedir(), ".ssh", "config");
 const PROFILES_FILE = _nodePath.join(_nodeOs.homedir(), ".config", "agent-ssh-tools", "profiles.json");
 const DEFAULT_PROBE_SECONDS = 6;
@@ -504,22 +504,26 @@ function sshToolsExtension(pi) {
     pi.setActiveTools(pi.getActiveTools().filter(name => !SSH_TOOL_NAMES.includes(name)));
   };
 
+  // Activate (or fail) a target. Returns a structured result so both the
+  // /sshactivate command and the ssh_target_select tool can reuse this.
   const activate = async (profile, ctx) => {
+    const reasonText = {
+      unreachable: "host unreachable",
+      refused: "connection refused",
+      auth: "authentication failed",
+      timeout: "login timed out",
+      "ssh-error": "ssh error",
+      "ssh-missing": "ssh binary not found"
+    };
+
     // Probe BEFORE setting any state. If probe fails, the user/agent sees
     // a clear categorized error and activeTarget stays null.
     const r = await probe(profile.remote);
     if (!r.ok) {
-      const reasonText = {
-        unreachable: "host unreachable",
-        refused: "connection refused",
-        auth: "authentication failed",
-        timeout: "login timed out",
-        "ssh-error": "ssh error",
-        "ssh-missing": "ssh binary not found"
-      };
       const ipSuffix = r.ip && r.ip !== profile.remote ? ` (${r.ip})` : "";
-      ctx.ui.notify(`SSH mode NOT activated: ${reasonText[r.reason] || r.reason}${ipSuffix} — ${r.detail}`, "warning");
-      return false;
+      const msg = `SSH mode NOT activated: ${reasonText[r.reason] || r.reason}${ipSuffix} — ${r.detail}`;
+      ctx.ui.notify(msg, "warning");
+      return { ok: false, reason: r.reason, detail: r.detail, message: msg };
     }
 
     const remoteCwd = await (async () => {
@@ -536,13 +540,21 @@ function sshToolsExtension(pi) {
 
     // Print the verify block so the agent/user can sanity-check
     // identity, user, hostname, cwd before the first mutation.
+    let verifyBlock = "";
     try {
-      const block = await buildVerifyBlock(activeTarget.remote, activeTarget.remoteCwd);
-      ctx.ui.notify(block, "info");
+      verifyBlock = await buildVerifyBlock(activeTarget.remote, activeTarget.remoteCwd);
+      ctx.ui.notify(verifyBlock, "info");
     } catch (e) {
-      ctx.ui.notify(`verify-block failed: ${e.message}`, "warning");
+      verifyBlock = `(verify-block failed: ${e.message})`;
+      ctx.ui.notify(verifyBlock, "warning");
     }
-    return true;
+
+    return {
+      ok: true,
+      target: activeTarget,
+      verifyBlock,
+      message: `target set: ${activeTarget.name} (host=${activeTarget.remote} cwd=${activeTarget.remoteCwd})`
+    };
   };
 
   const deactivate = ctx => {
@@ -553,6 +565,74 @@ function sshToolsExtension(pi) {
   };
 
   // ---- tools ----------------------------------------------------------
+
+  // Agent-callable target switch. Same probe + verify as the slash
+  // command, but exposed as a tool so the agent can change targets
+  // without asking the user. Use this when the user tells you to switch
+  // systems, or when you discover mid-task that you are on the wrong host.
+  pi.registerTool({
+    name: "ssh_target_select",
+    label: "ssh_target_select",
+    description: "Select an SSH target. Probes the host (TCP + ssh BatchMode whoami) and prints a verify block (user, hostname, cwd, key, date). On failure no state changes; on success the other ssh_* tools become usable.",
+    promptSnippet: "Switch the active SSH target with probe + verify",
+    promptGuidelines: [
+      "Call this whenever you need to operate on a remote host. Read the verify block it returns and confirm hostname / user / key / cwd match the user's intent before running ssh_read / ssh_write / ssh_edit / ssh_bash.",
+      "If the tool returns an error (unreachable / refused / auth / timeout), do NOT retry without changing something — the verify result is the truth about the current network/auth state.",
+      "The argument accepts aliases, profile names, ssh-config Host blocks, and the inline-cwd syntax 'name:/path'."
+    ],
+    parameters: {
+      type: "object",
+      properties: {
+        target: {
+          type: "string",
+          description: "Target name or alias. Use 'name:/path' to override the cwd."
+        }
+      },
+      required: ["target"]
+    },
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const arg = (params && params.target || "").trim();
+      if (!arg) {
+        return {
+          content: [{ type: "text", text: "ssh_target_select: missing 'target' argument" }],
+          details: { ok: false, reason: "bad-args" }
+        };
+      }
+
+      const profile = normalizeTargetArg(arg);
+      if (!profile.remote) {
+        return {
+          content: [{ type: "text", text: `ssh_target_select: cannot resolve target '${arg}'` }],
+          details: { ok: false, reason: "bad-args" }
+        };
+      }
+
+      // activate() handles probe + state + verify + UI notifications.
+      // We just translate its structured result into the tool response.
+      const r = await activate(profile, ctx);
+      if (!r.ok) {
+        return {
+          content: [{ type: "text", text: r.message }],
+          details: { ok: false, reason: r.reason, detail: r.detail }
+        };
+      }
+      return {
+        content: [{ type: "text", text: `${r.message}\n${r.verifyBlock}` }],
+        details: { ok: true, target: r.target }
+      };
+    },
+    renderCall(args, theme) {
+      const t = typeof args?.target === "string" ? args.target : "...";
+      return new _piTui.Text(
+        `${theme.fg("toolTitle", theme.bold("ssh_target_select"))} ${theme.fg("accent", t)}`,
+        0, 0
+      );
+    },
+    renderResult(result, theme) {
+      const text = result?.content?.[0]?.text || "";
+      return new _piTui.Text(text, 0, 0);
+    }
+  });
 
   pi.registerTool({
     name: "ssh_read",
@@ -660,10 +740,15 @@ function sshToolsExtension(pi) {
     renderResult: bashBase.renderResult
   });
 
-  // ---- /ssh command ---------------------------------------------------
+  // ---- /sshactivate command -------------------------------------------
 
-  pi.registerCommand("ssh", {
-    description: "Toggle remote SSH tools: /ssh, /ssh off, /ssh status, /ssh <host>[:/path]",
+  // Single entry point for the user. After typing `/sshactivate web01`
+  // (or selecting from the picker), the target is set, the four file/cmd
+  // tools become available, and the agent can use them via its own
+  // tool-call layer — including `ssh_target_select` to switch later.
+
+  pi.registerCommand("sshactivate", {
+    description: "Activate an SSH target: /sshactivate, /sshactivate <host>[:/path], /sshactivate off, /sshactivate status",
     getArgumentCompletions: prefix => {
       const { merged } = refreshProfiles();
       const options = ["off", "status", ...merged.map(p => p.name)];
@@ -694,7 +779,7 @@ function sshToolsExtension(pi) {
       if (!input) {
         const { merged } = refreshProfiles();
         if (merged.length === 0) {
-          ctx.ui.notify("No SSH hosts found. Use /ssh <host>[:/path] or add a profile to ~/.config/agent-ssh-tools/profiles.json", "warning");
+          ctx.ui.notify("No SSH hosts found. Use /sshactivate <host>[:/path] or add a profile to ~/.config/agent-ssh-tools/profiles.json", "warning");
           return;
         }
         const items = [...(activeTarget ? ["off"] : []), ...merged.map(p => p.name)];
