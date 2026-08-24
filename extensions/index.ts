@@ -468,18 +468,23 @@ async function execSshEdit(editBase, pi, target, localCwd, params) {
 function sshToolsExtension(pi) {
   let activeTarget = null;
 
-  // CLI flag detection. When the user invokes `pi -p "..." --ssh-activate`
-  // (or any other pi command with this flag), the SSH tools are enabled
-  // automatically at session_start so the agent can use them without
-  // the user having to type /sshactivate first. Useful for automated
-  // test runs and agent harnesses that already know the target.
+  // CLI flag detection. Pi's argv parser rejects unknown flags, so
+  // instead of `--ssh-activate` the plugin reads an environment
+  // variable that wrappers and test harnesses can set:
   //
-  // Note: this only enables the tools. Target selection still happens
-  // via ssh_target_select — the agent must pick the host explicitly
-  // so the verify-block runs and the connection is probed.
+  //   SSH_CLI_AUTO_ACTIVATE=1 pi -p "ssh_target_select pve-docker"
+  //
+  // When set, the SSH tools are auto-enabled at session_start so the
+  // agent can use them without the user typing /sshactivate first.
+  // Target selection still requires ssh_target_select (probe + verify
+  // runs as usual). /sshactivate off explicitly overrides.
   const autoActivateFromCli = (() => {
     try {
-      return Array.isArray(process.argv) && process.argv.includes("--ssh-activate");
+      const fromEnv = process.env.SSH_CLI_AUTO_ACTIVATE === "1";
+      // Also accept the literal flag string as a fallback for wrappers
+      // that inject into process.argv directly.
+      const fromArgv = Array.isArray(process.argv) && process.argv.includes("--ssh-activate");
+      return fromEnv || fromArgv;
     } catch {
       return false;
     }
@@ -822,10 +827,10 @@ function sshToolsExtension(pi) {
       enableSshTools();
       ctx.ui.setStatus(
         SSH_STATUS_KEY,
-        ctx.ui.theme.fg("accent", "SSH (auto via --ssh-activate)")
+        ctx.ui.theme.fg("accent", "SSH (auto via SSH_CLI_AUTO_ACTIVATE=1)")
       );
       ctx.ui.notify(
-        "SSH tools auto-enabled via --ssh-activate. Call ssh_target_select <host> to pick a target.",
+        "SSH tools auto-enabled via SSH_CLI_AUTO_ACTIVATE=1. Call ssh_target_select <host> to pick a target.",
         "info"
       );
     } else {
