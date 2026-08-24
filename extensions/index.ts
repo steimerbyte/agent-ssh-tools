@@ -58,21 +58,8 @@ function readProfiles() {
 
 // ---- ~/.ssh/config parser ---------------------------------------------
 
-// Module-level cache for ssh_config profiles. Re-parsed only when the
-// file's mtime changes (or after TTL). Saves a few ms per tool call in
-// sessions that call ssh_target_select multiple times.
-const sshConfigCache = { mtimeMs: 0, profiles: null, ts: 0 };
-const SSH_CONFIG_CACHE_TTL_MS = 5_000;
-
 function parseSshConfigProfiles() {
   if (!_nodeFs.existsSync(SSH_CONFIG_PATH)) return [];
-  const stat = _nodeFs.statSync(SSH_CONFIG_PATH);
-  const now = Date.now();
-  if (sshConfigCache.profiles &&
-      sshConfigCache.mtimeMs === stat.mtimeMs &&
-      (now - sshConfigCache.ts) < SSH_CONFIG_CACHE_TTL_MS) {
-    return sshConfigCache.profiles;
-  }
   const text = _nodeFs.readFileSync(SSH_CONFIG_PATH, "utf8");
   const profiles = new Map();
   for (const rawLine of text.split("\n")) {
@@ -85,11 +72,7 @@ function parseSshConfigProfiles() {
       if (!profiles.has(alias)) profiles.set(alias, { name: alias, remote: alias });
     }
   }
-  const arr = Array.from(profiles.values()).sort((a, b) => a.name.localeCompare(b.name));
-  sshConfigCache.mtimeMs = stat.mtimeMs;
-  sshConfigCache.profiles = arr;
-  sshConfigCache.ts = now;
-  return arr;
+  return Array.from(profiles.values()).sort((a, b) => a.name.localeCompare(b.name));
 }
 
 // Refresh profile list from both profiles.json aliases and ~/.ssh/config.
@@ -117,39 +100,11 @@ function refreshProfiles() {
 //   1. profiles.json aliases[arg]
 //   2. profiles.json profiles[arg] (custom host + cwd)
 //   3. ~/.ssh/config Host block
-//   4. raw arg as fallback (marked `untrusted: true`)
-//
+//   4. raw arg as fallback
 // Inline ":path" syntax sets an inline cwd that always wins.
-//
-// `untrusted: true` means the name did not match any configured source.
-// Callers should refuse to probe in that state — passing arbitrary
-// strings to ssh(1) would let a typo or prompt-injection turn into
-// a connection attempt to the wrong host.
-// Whitelist for safe target strings. ssh hostnames/aliases/paths are
-// allowed to contain letters, digits, dots, hyphens, underscores and
-// slashes (for user@host:port notation). Anything else — newlines,
-// shell metacharacters, spaces — is rejected. Prevents command
-// injection through profile names, inline cwd, or ssh_config entries
-// and keeps before_agent_start prompts free of newline-based prompt
-// injection. Single ':' separator allowed for host:/path syntax.
-const SAFE_TARGET_RE = /^[A-Za-z0-9._@\-\/:]+$/;
-
-function isSafeTargetString(s) {
-  return typeof s === "string" && s.length > 0 && SAFE_TARGET_RE.test(s);
-}
-
 function normalizeTargetArg(arg) {
   const trimmed = (arg || "").trim();
-  if (!trimmed) return { name: "", remote: "", cwd: undefined, untrusted: true, error: "empty target" };
-  if (!isSafeTargetString(trimmed)) {
-    return {
-      name: trimmed,
-      remote: "",
-      cwd: undefined,
-      untrusted: true,
-      error: `target '${trimmed.slice(0, 60)}' contains unsafe characters (allowed: A-Z a-z 0-9 . _ @ - / :)`,
-    };
-  }
+  if (!trimmed) return { name: "", remote: "", cwd: undefined };
 
   const data = readProfiles();
   const aliases  = data.aliases  || {};
@@ -163,78 +118,29 @@ function normalizeTargetArg(arg) {
     resolved  = resolved.slice(0, colon);
   }
 
-  // Inline cwd must also pass the whitelist (no newlines, no shell
-  // metacharacters that could break out of `cd <cwd> && cmd`).
-  if (inlineCwd && !isSafeTargetString(inlineCwd)) {
-    return {
-      name: resolved,
-      remote: "",
-      cwd: undefined,
-      untrusted: true,
-      error: `inline cwd '${inlineCwd.slice(0, 60)}' contains unsafe characters`,
-    };
-  }
-
   // ssh-config match wins over same-name profile (Host block is the
   // canonical source for host/port/identity), but cwd from profile is
   // ignored when inline cwd is given.
   const sshCfg = parseSshConfigProfiles().find(p => p.name === resolved);
 
-  // Sanitise any cwd that originated from profiles.json / ssh_config.
-  const safeCwd = (c) => (c && isSafeTargetString(c)) ? c : undefined;
-
   const prof = profiles[resolved];
   let remote, cwd;
   if (sshCfg) {
     remote = sshCfg.remote;
-    cwd    = safeCwd(inlineCwd) || safeCwd(prof ? prof.cwd : undefined);
+    cwd    = inlineCwd || (prof ? prof.cwd : undefined);
   } else if (prof) {
-    remote = (prof.host && isSafeTargetString(prof.host)) ? prof.host : resolved;
-    cwd    = safeCwd(inlineCwd) || safeCwd(prof.cwd);
+    remote = prof.host || resolved;
+    cwd    = inlineCwd || prof.cwd;
   } else {
-    // No profile, no alias, no ssh-config Host block. Do NOT silently
-    // pass this through to ssh(1) — the user probably mistyped or the
-    // model invented a name. Caller must reject via `untrusted: true`.
-    return {
-      name: resolved,
-      remote: resolved,
-      cwd: safeCwd(inlineCwd),
-      untrusted: true,
-      error: `target '${trimmed}' not found in profiles, aliases, or ~/.ssh/config`,
-    };
+    remote = resolved;
+    cwd    = inlineCwd;
   }
 
-  // Final gate: any cwd we kept must be safe. If ssh_config provided
-  // an unsafe cwd, drop it.
-  if (cwd && !isSafeTargetString(cwd)) cwd = undefined;
-
-  return { name: resolved, remote, cwd, untrusted: false };
-}
-
-// Human-readable list of available targets for error messages.
-function sshCliAvailableTargets(): string {
-  const data = readProfiles();
-  const profNames = Object.keys(data.profiles || {});
-  const sshHosts = parseSshConfigProfiles().map(p => p.name);
-  const aliasNames = Object.keys(data.aliases || {});
-  // profile names first, then alias->target, then ssh-config hosts not already covered
-  const out: string[] = [...profNames];
-  for (const [alias, target] of Object.entries(data.aliases || {})) {
-    out.push(`${alias} -> ${target}`);
-  }
-  for (const h of sshHosts) {
-    if (!profNames.includes(h)) out.push(h);
-  }
-  if (aliasNames.length === 0 && profNames.length === 0 && sshHosts.length === 0) {
-    return "(none configured)";
-  }
-  return out.join(", ");
+  return { name: resolved, remote, cwd };
 }
 
 // ---- ssh wrappers -----------------------------------------------------
 
-// sshExec: existing core wrapper. Keeps stdout/stderr separate; tools
-// can build their own verbose headers from these primitives.
 function sshExec(remote, command, options = {}) {
   return new Promise((resolve, reject) => {
     const args = [];
@@ -260,12 +166,6 @@ function sshExec(remote, command, options = {}) {
 
     child.stdout.on("data", d => { stdoutChunks.push(d); options.onStdoutData?.(d); });
     child.stderr.on("data", d => { stderrChunks.push(d); options.onStderrData?.(d); });
-    if (options.stdin !== undefined) {
-      child.stdin.write(options.stdin);
-      child.stdin.end();
-    } else {
-      child.stdin.end();
-    }
     child.on("error", err => {
       if (killTimer) clearTimeout(killTimer);
       reject(err);
@@ -285,38 +185,6 @@ function sshExec(remote, command, options = {}) {
   });
 }
 
-// Format a one-line verbose header that prefixes every ssh_* tool result.
-// Shows target host, command, exit code, ms, stderr-summary.
-//   $ ssh pve-docker 'whoami'   exit=0  546ms
-function formatSshHeader(remote, command, exitCode, elapsedMs, stderrText) {
-  const cmdShort = command.length > 80 ? command.slice(0, 77) + "..." : command;
-  const errShort = stderrText ? stderrText.split("\n")[0].slice(0, 60) : "";
-  let line = `$ ssh ${remote} ${JSON.stringify(cmdShort)}  exit=${exitCode}  ${elapsedMs}ms`;
-  if (errShort) line += `\n  stderr: ${errShort}`;
-  return line;
-}
-
-// Run an ssh command, return a verbose envelope the tools can prepend
-// to their content blocks. Always non-throwing; tools inspect `exit`/`stderr`.
-async function sshExecVerbose(remote, command, options = {}) {
-  const t0 = Date.now();
-  let exit = 0;
-  let stdout: Buffer = Buffer.alloc(0);
-  let stderr: Buffer = Buffer.alloc(0);
-  try {
-    const r = await sshExec(remote, command, options);
-    exit = r.exitCode;
-    stdout = r.stdout;
-    stderr = r.stderr;
-  } catch (e: any) {
-    exit = 124;
-    stderr = Buffer.from(String(e?.message ?? e));
-  }
-  const elapsed = Date.now() - t0;
-  const header = formatSshHeader(remote, command, exit, elapsed, stderr.toString("utf8").trim());
-  return { exit, stdout, stderr, elapsedMs: elapsed, header };
-}
-
 async function sshOk(remote, command, options = {}) {
   const { stdout, stderr, exitCode } = await sshExec(remote, command, options);
   if (exitCode !== 0) {
@@ -329,20 +197,9 @@ async function sshOk(remote, command, options = {}) {
 // Categorize an ssh failure into agent-friendly reasons.
 // Returns { ok: true, user, ip } or { ok: false, reason, detail, ip }.
 async function probe(remote, seconds = DEFAULT_PROBE_SECONDS) {
-  // DNS lookup with its own short timeout so a slow DNS resolver does
-  // not eat the whole probe budget. Fall back to the raw hostname if
-  // the lookup hangs.
-  const dnsTimeout = new Promise<string>(resolve => {
-    setTimeout(() => resolve(remote), Math.min(seconds * 1000, 1500));
-  });
-  const dnsLookup = (async () => {
-    try {
-      return (await _nodeDns.promises.lookup(remote)).address;
-    } catch {
-      return remote;
-    }
-  })();
-  const ip = await Promise.race([dnsLookup, dnsTimeout]);
+  // DNS lookup for error messages (best-effort, may throw).
+  let ip = remote;
+  try { ip = (await _nodeDns.promises.lookup(remote)).address; } catch {}
 
   // Step 1: TCP connect on :22.
   const portOk = await new Promise(resolve => {
@@ -440,47 +297,21 @@ function fingerprintFor(keyPath) {
 async function buildVerifyBlock(remote, cwd, seconds = 6) {
   const idFile = identityFileFor(remote);
   const fp     = fingerprintFor(idFile);
-  const t = seconds;
-  // Single ssh call with a safe separator. One TCP+auth handshake
-  // instead of three. Use whoami/hostname directly (more portable than
-  // $USER/$HOSTNAME which can be empty in some shells) and run date via
-  // sh -c so $(...) substitution survives ssh-stdin properly.
-  const SEP = "@@ssh-cli-verify@@";
-  // Build the command as a single-quoted bash script. SEP must remain
-  // literal in the remote shell so we can split on it. We use the safe
-  // pattern: `'`, value, `'` -> splits a single-quoted string with
-  // `'`\\''` to insert a literal apostrophe. No JS template literal
-  // interpolation touches the SEP marker.
-  //
-  // bash -c over ssh runs without a login shell so PATH may be empty
-  // — set it explicitly. Use `uname -n` for hostname (universal)
-  // rather than `hostname` (missing on minimal distros/WSL).
-  const q = (v) => "'" + String(v).replace(/'/g, "'\\''") + "'";
-  const cmd =
-    `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ` +
-    `printf '%s\\n' "$(whoami)" ${q(SEP)} "$(uname -n)" ${q(SEP)} "$(date -u +%Y-%m-%dT%H:%M:%SZ)"`;
-  let user = "<error>", hostname = "<error>", date = "<error>";
-  try {
-    const r = await sshExec(remote, cmd, { timeoutSeconds: t });
-    if (r.exitCode === 0) {
-      const parts = r.stdout.toString("utf8").trim().split(SEP);
-      if (parts.length >= 3) {
-        user = parts[0].trim();
-        hostname = parts[1].trim();
-        date = parts[2].trim();
-      }
-    } else {
-      user = `<ssh-exit-${r.exitCode}>`;
-    }
-  } catch (e: any) {
-    user = `<timeout>`;
-  }
+  const t      = seconds;
+  const [u, hn, dt] = await Promise.all([
+    sshExec(remote, "whoami",         { timeoutSeconds: t }).catch(e => ({ stdout: Buffer.from(`<error:${e.message}>`), stderr: Buffer.alloc(0), exitCode: -1 })),
+    sshExec(remote, "hostname",       { timeoutSeconds: t }).catch(e => ({ stdout: Buffer.from(`<error:${e.message}>`), stderr: Buffer.alloc(0), exitCode: -1 })),
+    sshExec(remote, "date -u +%Y-%m-%dT%H:%M:%SZ", { timeoutSeconds: t }).catch(e => ({ stdout: Buffer.from(`<error:${e.message}>`), stderr: Buffer.alloc(0), exitCode: -1 }))
+  ]);
+  const user     = u.stdout.toString("utf8").trim();
+  const hostname = hn.stdout.toString("utf8").trim();
+  const date     = dt.stdout.toString("utf8").trim();
   const lines = [
     "verify:",
     `  user:     ${user}`,
     `  hostname: ${hostname}`,
     `  cwd:      ${cwd || "(remote default ~)"}`,
-    `  key:      ${fp || "(no identity file)"}`,  // never expose the key path
+    `  key:      ${fp || "(no identity file)"}${idFile ? `  (${idFile})` : ""}`,
     `  date:     ${date}`
   ];
   return lines.join("\n");
@@ -558,9 +389,7 @@ function createRemoteBashOps(target) {
       const script = `cd ${shellQuote(cwd || target.remoteCwd)}\n${command}\n`;
       const { exitCode } = await sshExec(target.remote, "exec bash -se", {
         stdin: script,
-        // Default to 30 s if the caller didn't set one. Without this
-        // a long-running remote command could hang the agent forever.
-        timeoutSeconds: typeof timeout === "number" && timeout > 0 ? timeout : DEFAULT_SSH_TIMEOUT_SECONDS,
+        timeoutSeconds: timeout,
         onStdoutData: onData,
         onStderrData: onData
       });
@@ -616,18 +445,9 @@ async function execSshEdit(editBase, pi, target, localCwd, params) {
   try { _nodeFs.unlinkSync(tmpFile); } catch {}
 
   if (beforeSha === afterSha) {
-    // Unchanged: native edit result with diff empty -> renderer shows no diff.
-    // Override `details.path` so the renderer shows the real remote path
-    // instead of the local tmp file path used internally.
-    const details = { ...(result.details ?? {}), unchanged: true, path: absoluteRemote };
-    if (typeof details.diff === "string") {
-      // Diff text usually starts with "--- <old>" / "+++ <new>" headers;
-      // strip those out so the unchanged block is silent.
-      details.diff = "";
-    }
     return {
-      content: result.content ?? [{ type: "text", text: "" }],
-      details
+      content: [{ type: "text", text: `No changes — ${absoluteRemote} was already up to date.` }],
+      details: { unchanged: true }
     };
   }
 
@@ -637,18 +457,9 @@ async function execSshEdit(editBase, pi, target, localCwd, params) {
     stdin: Buffer.from(afterContent, "utf8")
   });
 
-  // Return native edit result so renderer shows the diff against the
-  // original content. Override path: details.path and any diff header
-  // paths to the real remote path so the user never sees the tmp file.
-  const details = { ...(result.details ?? {}), unchanged: false, path: absoluteRemote, bytes: afterContent.length };
-  if (typeof details.diff === "string") {
-    details.diff = details.diff
-      .replace(/^--- .*$/m, `--- ${absoluteRemote}`)
-      .replace(/^\+\+\+ .*$/m, `+++ ${absoluteRemote}`);
-  }
   return {
-    content: result.content ?? [{ type: "text", text: `${afterContent.length} bytes` }],
-    details
+    content: [{ type: "text", text: `pushed ${absoluteRemote} (${afterContent.length} bytes)` }],
+    details: { unchanged: false, bytes: afterContent.length }
   };
 }
 
@@ -657,11 +468,23 @@ async function execSshEdit(editBase, pi, target, localCwd, params) {
 function sshToolsExtension(pi) {
   let activeTarget = null;
 
-  // NOTE: we never pass the local process.cwd() to native tool
-  // definitions. The local cwd is irrelevant for remote operations —
-  // exposing it would leak where this plugin happens to be installed.
-  // Use the remote cwd (or `/`) as the tool's cwd so that any local
-  // path that ends up in renderResult is sanitised.
+  // CLI flag detection. When the user invokes `pi -p "..." --ssh-activate`
+  // (or any other pi command with this flag), the SSH tools are enabled
+  // automatically at session_start so the agent can use them without
+  // the user having to type /sshactivate first. Useful for automated
+  // test runs and agent harnesses that already know the target.
+  //
+  // Note: this only enables the tools. Target selection still happens
+  // via ssh_target_select — the agent must pick the host explicitly
+  // so the verify-block runs and the connection is probed.
+  const autoActivateFromCli = (() => {
+    try {
+      return Array.isArray(process.argv) && process.argv.includes("--ssh-activate");
+    } catch {
+      return false;
+    }
+  })();
+
   const REMOTE_NEUTRAL_CWD = "/";
   const readBase  = _piCodingAgent.createReadToolDefinition(REMOTE_NEUTRAL_CWD);
   const writeBase = _piCodingAgent.createWriteToolDefinition(REMOTE_NEUTRAL_CWD);
@@ -793,20 +616,8 @@ function sshToolsExtension(pi) {
       const profile = normalizeTargetArg(arg);
       if (!profile.remote) {
         return {
-          content: [{ type: "text", text: `ssh_target_select: ${profile.error || "cannot resolve target"}` }],
-          details: { ok: false, reason: "bad-args", error: profile.error }
-        };
-      }
-      if (profile.untrusted) {
-        // Name did not match profiles, aliases, or ~/.ssh/config.
-        // Refuse to probe — a mistyped name like "current" must not
-        // result in a connection attempt to an arbitrary host.
-        const msg = profile.error
-          || `target '${arg}' not found in profiles, aliases, or ~/.ssh/config`;
-        ctx.ui.notify(`ssh_target_select: ${msg}`, "warning");
-        return {
-          content: [{ type: "text", text: `ssh_target_select: ${msg}\n\nAvailable targets: ${sshCliAvailableTargets()}` }],
-          details: { ok: false, reason: "unknown-target", error: msg }
+          content: [{ type: "text", text: `ssh_target_select: cannot resolve target '${arg}'` }],
+          details: { ok: false, reason: "bad-args" }
         };
       }
 
@@ -831,7 +642,10 @@ function sshToolsExtension(pi) {
         0, 0
       );
     },
-    renderResult: readBase.renderResult
+    renderResult(result, theme) {
+      const text = result?.content?.[0]?.text || "";
+      return new _piTui.Text(text, 0, 0);
+    }
   });
 
   pi.registerTool({
@@ -843,15 +657,13 @@ function sshToolsExtension(pi) {
     parameters: readBase.parameters,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const target = requireActiveTarget();
+      // Map relative path against remote cwd.
       const abs = _nodePath.isAbsolute(params.path)
         ? params.path
         : joinRemote(target.remoteCwd, params.path);
-      const t0 = Date.now();
-      const tool = _piCodingAgent.createReadToolDefinition(target.remoteCwd, { operations: createRemoteReadOps(target) });
       const transformed = { ...params, path: abs };
-      const result = await tool.execute(toolCallId, transformed, signal, onUpdate, ctx);
-      ctx.ui.notify(`$ ssh ${target.remote} read ${abs}  ${Date.now() - t0}ms`, "info");
-      return result;
+      const tool = _piCodingAgent.createReadToolDefinition(target.remoteCwd, { operations: createRemoteReadOps(target) });
+      return tool.execute(toolCallId, transformed, signal, onUpdate, ctx);
     },
     renderCall(args, theme) {
       const path = typeof args?.path === "string" ? args.path : "...";
@@ -876,12 +688,9 @@ function sshToolsExtension(pi) {
       const abs = _nodePath.isAbsolute(params.path)
         ? params.path
         : joinRemote(target.remoteCwd, params.path);
-      const t0 = Date.now();
-      const tool = _piCodingAgent.createWriteToolDefinition(target.remoteCwd, { operations: createRemoteWriteOps(target) });
       const transformed = { ...params, path: abs };
-      const result = await tool.execute(toolCallId, transformed, signal, onUpdate, ctx);
-      ctx.ui.notify(`$ ssh ${target.remote} write ${abs}  ${Date.now() - t0}ms`, "info");
-      return result;
+      const tool = _piCodingAgent.createWriteToolDefinition(target.remoteCwd, { operations: createRemoteWriteOps(target) });
+      return tool.execute(toolCallId, transformed, signal, onUpdate, ctx);
     },
     renderCall(args, theme) {
       const path = typeof args?.path === "string" ? args.path : "...";
@@ -908,10 +717,7 @@ function sshToolsExtension(pi) {
     prepareArguments: editBase.prepareArguments,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const target = requireActiveTarget();
-      const t0 = Date.now();
-      const result = await execSshEdit(editBase, pi, target, process.cwd(), params);
-      ctx.ui.notify(`$ ssh ${target.remote} edit ${(result.details as any)?.path ?? params.path}  ${Date.now() - t0}ms`, "info");
-      return result;
+      return execSshEdit(editBase, pi, target, process.cwd(), params);
     },
     renderCall(args, theme) {
       const path = typeof args?.path === "string" ? args.path : "...";
@@ -921,31 +727,7 @@ function sshToolsExtension(pi) {
         0, 0
       );
     },
-    renderResult(result, _options, theme) {
-      // Custom renderer: never expose the internal tmp file path. The
-      // native edit renderer reads `context.args.path` and would show
-      // `/tmp/agent-ssh-tools-edit-<pid>-<ts>.txt` even though the edit
-      // actually landed on the real target file. We render only the
-      // remote path + diff body, never the local tmp path.
-      const details = (result?.details ?? {}) as { path?: string; diff?: string; unchanged?: boolean };
-      const remotePath = details.path ?? "(unknown)";
-      const diffText = details.diff ?? "";
-      if (details.unchanged || !diffText.trim()) {
-        return new _piTui.Text(
-          `${theme.fg("muted", "(no changes)")}\n${theme.fg("muted", remotePath)}`,
-          0, 0
-        );
-      }
-      // Strip the diff's --- /+++ file header lines that would leak
-      // the local tmp path. Then render with the remote path as a
-      // visible header.
-      const cleanDiff = diffText
-        .replace(/^--- .*$/m, "")
-        .replace(/^\+\+\+ .*$/m, "")
-        .replace(/^\n+/, "");
-      const header = `${theme.fg("accent", remotePath)}\n`;
-      return new _piTui.Text(`${header}${cleanDiff}`, 0, 0);
-    }
+    renderResult: editBase.renderResult
   });
 
   pi.registerTool({
@@ -957,24 +739,8 @@ function sshToolsExtension(pi) {
     parameters: bashBase.parameters,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const target = requireActiveTarget();
-      const cwd = target.remoteCwd;
-      const cmd = params.command;
-      const fullCmd = cwd ? `cd ${shellQuote(cwd)} && ${cmd}` : cmd;
-      const r = await sshExecVerbose(target.remote, fullCmd, { timeoutSeconds: params.timeout ?? 60 });
-      // Output only — the renderResult composes the verbose header.
-      const parts: string[] = [];
-      if (r.stdout.length) parts.push(r.stdout.toString("utf8").trimEnd());
-      if (r.stderr.length && r.exit !== 0) parts.push(`[stderr]\n${r.stderr.toString("utf8").trimEnd()}`);
-      return {
-        content: [{ type: "text", text: parts.join("\n\n") }],
-        details: {
-          exit: r.exit,
-          elapsedMs: r.elapsedMs,
-          cwd,
-          host: target.remote,
-          cmd
-        }
-      };
+      const tool = _piCodingAgent.createBashToolDefinition(target.remoteCwd, { operations: createRemoteBashOps(target) });
+      return tool.execute(toolCallId, params, signal, onUpdate, ctx);
     },
     renderCall(args, theme, context) {
       const command = typeof args?.command === "string" ? args.command : "...";
@@ -985,22 +751,7 @@ function sshToolsExtension(pi) {
       );
       return text;
     },
-    renderResult(result, _options, theme) {
-      const details = (result?.details ?? {}) as { cwd?: string; host?: string; exit?: number; elapsedMs?: number };
-      const host = details.host ?? "?";
-      const cwd = details.cwd ?? "";
-      const exit = details.exit ?? 0;
-      const ms = details.elapsedMs ?? 0;
-      const exitLabel = exit === 0 ? theme.fg("success", "ok") : theme.fg("error", `exit ${exit}`);
-      const header = theme.fg("muted", `$ ssh ${host}  cwd=${cwd || "/"}  ${exitLabel}  ${ms}ms`);
-      const stdout = (result?.content ?? [])
-        .map((c: any) => (c.type === "text" ? c.text : ""))
-        .join("\n");
-      // stdout already contains the command text + output. Trim the
-      // duplicated first line if it duplicates the host line.
-      const body = stdout.trim();
-      return new _piTui.Text(`${header}\n${body}`, 0, 0);
-    }
+    renderResult: bashBase.renderResult
   });
 
   // ---- /sshactivate command -------------------------------------------
@@ -1046,12 +797,7 @@ function sshToolsExtension(pi) {
       // target in one step (probe + verify runs as part of activate).
       // Equivalent to bare /sshactivate followed by ssh_target_select.
       if (input) {
-        const profile = normalizeTargetArg(input);
-        if (profile.untrusted) {
-          ctx.ui.notify(`sshactivate: ${profile.error}\nAvailable: ${sshCliAvailableTargets()}`, "warning");
-          return;
-        }
-        await activate(profile, ctx);
+        await activate(normalizeTargetArg(input), ctx);
         return;
       }
 
@@ -1068,8 +814,24 @@ function sshToolsExtension(pi) {
 
   pi.on("session_start", async (_event, ctx) => {
     activeTarget = null;
-    disableSshTools();
-    updateStatus(ctx);
+    if (autoActivateFromCli) {
+      // CLI auto-activation: keep tools enabled across sessions so the
+      // agent can immediately use ssh_target_select. The status line
+      // marks this so the user can see why the tools are on without
+      // having typed /sshactivate.
+      enableSshTools();
+      ctx.ui.setStatus(
+        SSH_STATUS_KEY,
+        ctx.ui.theme.fg("accent", "SSH (auto via --ssh-activate)")
+      );
+      ctx.ui.notify(
+        "SSH tools auto-enabled via --ssh-activate. Call ssh_target_select <host> to pick a target.",
+        "info"
+      );
+    } else {
+      disableSshTools();
+      updateStatus(ctx);
+    }
   });
 
   pi.on("before_agent_start", async event => {
