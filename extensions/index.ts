@@ -509,6 +509,21 @@ function createRemoteReadOps(target) {
 function createRemoteWriteOps(target) {
   return {
     writeFile: async (absolutePath, content) => {
+      // Symlink check: reject writes if the target path is a symlink.
+      // readlink -f resolves the canonical target; we block when the
+      // path exists AND points elsewhere (so missing-file writes still work).
+      try {
+        await sshOk(target.remote,
+          `if [ -L ${shellQuote(absolutePath)} ]; then p=$(readlink -f ${shellQuote(absolutePath)}); echo "SYMLINK $p"; exit 9; fi; exit 0`,
+          { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS });
+      } catch (e) {
+        const msg = String((e as any)?.message ?? e);
+        if (msg.includes("exit (9)")) {
+          throw new Error(`refusing to write through symlink: ${absolutePath}`);
+        }
+        throw e;
+      }
+      // Real write: send content via stdin to a cat-heredoc-shell-quoted path
       await sshOk(target.remote, `cat > ${shellQuote(absolutePath)}`, {
         timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS,
         stdin: content
@@ -631,7 +646,24 @@ async function execSshEdit(editBase, pi, target, localCwd, params) {
     };
   }
 
-  // Push via the same ssh transport.
+  // Push via the same ssh transport. Symlink check identical to
+  // createRemoteWriteOps: refuse if the target became a symlink between
+  // the pull and the push (TOCTOU race window is small but real).
+  try {
+    await sshOk(target.remote,
+      `if [ -L ${shellQuote(absoluteRemote)} ]; then exit 9; fi; exit 0`,
+      { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS });
+  } catch (e) {
+    const msg = String((e as any)?.message ?? e);
+    if (msg.includes("exit (9)")) {
+      try { _nodeFs.unlinkSync(tmpFile); } catch {}
+      return {
+        content: [{ type: "text", text: `refused: ${absoluteRemote} is a symlink — edit aborted` }],
+        details: { unchanged: false, error: "symlink", path: absoluteRemote }
+      };
+    }
+    throw e;
+  }
   await sshOk(target.remote, `cat > ${shellQuote(absoluteRemote)}`, {
     timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS,
     stdin: Buffer.from(afterContent, "utf8")
@@ -980,7 +1012,34 @@ function sshToolsExtension(pi) {
       const cwd = target.remoteCwd;
       const cmd = params.command;
       const fullCmd = cwd ? `cd ${shellQuote(cwd)} && ${cmd}` : cmd;
+      const t0 = Date.now();
       const r = await sshExecVerbose(target.remote, fullCmd, { timeoutSeconds: params.timeout ?? 60 });
+      const elapsed = Date.now() - t0;
+      // Audit log: append-only file with command + target + result. Lets
+      // the user audit destructive remote commands after the fact. Path:
+      // ~/.config/agent-ssh-tools/audit.log (atomic append via O_APPEND).
+      try {
+        const auditPath = require("node:path").join(_nodeOs.homedir(), ".config", "agent-ssh-tools", "audit.log");
+        require("node:fs").mkdirSync(require("node:path").dirname(auditPath), { recursive: true });
+        const crypto = require("node:crypto");
+        const stdoutHash = crypto.createHash("sha256").update(r.stdout).digest("hex").slice(0, 12);
+        const stderrHash = crypto.createHash("sha256").update(r.stderr).digest("hex").slice(0, 12);
+        const line = [
+          new Date().toISOString(),
+          target.name,
+          target.remote,
+          cwd || "/",
+          `exit=${r.exit}`,
+          `${elapsed}ms`,
+          `out=${stdoutHash}`,
+          `err=${stderrHash}`,
+          JSON.stringify(cmd)
+        ].join("\t") + "\n";
+        require("node:fs").appendFileSync(auditPath, line, { flag: "a" });
+      } catch (e) {
+        // Audit failures must not break tool execution.
+        ctx?.ui?.notify?.(`audit log write failed: ${(e as any)?.message ?? e}`, "warning");
+      }
       // Output only — the renderResult composes the verbose header.
       const parts: string[] = [];
       if (r.stdout.length) parts.push(r.stdout.toString("utf8").trimEnd());
@@ -989,7 +1048,7 @@ function sshToolsExtension(pi) {
         content: [{ type: "text", text: parts.join("\n\n") }],
         details: {
           exit: r.exit,
-          elapsedMs: r.elapsedMs,
+          elapsedMs: elapsed,
           cwd,
           host: target.remote,
           cmd
@@ -1045,20 +1104,35 @@ function sshToolsExtension(pi) {
       const input = args.trim();
 
       if (input === "status") {
-        if (!activeTarget) {
-          ctx.ui.notify("SSH tools enabled. No target selected yet — agent must call ssh_target_select.", "info");
-          return;
+        // Show all three states clearly: off / enabled-no-target / active
+        const sshToolsActive = (pi.getActiveTools() || []).includes(SSH_TOOL_NAMES[0]);
+        if (activeTarget) {
+          ctx.ui.notify(
+            `SSH: ACTIVE  target=${activeTarget.name}  remote=${activeTarget.remote}  cwd=${activeTarget.remoteCwd}  tools=on`,
+            "info"
+          );
+        } else if (sshToolsActive) {
+          ctx.ui.notify(
+            "SSH: tools enabled, no target selected — call ssh_target_select <host>",
+            "info"
+          );
+        } else {
+          ctx.ui.notify(
+            "SSH: off — run /sshactivate to enable tools, /sshactivate <host> for one-shot",
+            "info"
+          );
         }
-        ctx.ui.notify(`SSH mode: ${activeTarget.name} (${activeTarget.remote}:${activeTarget.remoteCwd})`, "info");
         return;
       }
 
       if (input === "off") {
         if (!activeTarget) {
-          ctx.ui.notify("SSH mode is already off", "info");
+          ctx.ui.notify("SSH already off (no target was active)", "info");
           return;
         }
+        const prev = activeTarget.name;
         deactivate(ctx);
+        ctx.ui.notify(`SSH mode off (was: ${prev}). Reload picks it up again or use /sshactivate.`, "info");
         return;
       }
 
@@ -1103,7 +1177,7 @@ function sshToolsExtension(pi) {
       );
     } else {
       disableSshTools();
-      updateStatus(ctx);
+      ctx.ui.setStatus(SSH_STATUS_KEY, undefined);
     }
   });
 
