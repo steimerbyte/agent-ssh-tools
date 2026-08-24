@@ -519,9 +519,10 @@ async function execSshEdit(editBase, pi, target, localCwd, params) {
   try { _nodeFs.unlinkSync(tmpFile); } catch {}
 
   if (beforeSha === afterSha) {
+    // Unchanged: native edit result with diff empty -> renderer shows no diff.
     return {
-      content: [{ type: "text", text: `No changes — ${absoluteRemote} was already up to date.` }],
-      details: { unchanged: true }
+      content: result.content ?? [{ type: "text", text: "" }],
+      details: { ...(result.details ?? {}), unchanged: true, path: absoluteRemote }
     };
   }
 
@@ -531,9 +532,11 @@ async function execSshEdit(editBase, pi, target, localCwd, params) {
     stdin: Buffer.from(afterContent, "utf8")
   });
 
+  // Return native edit result so renderer shows the diff against the
+  // original content (which editBase already produced).
   return {
-    content: [{ type: "text", text: `pushed ${absoluteRemote} (${afterContent.length} bytes)` }],
-    details: { unchanged: false, bytes: afterContent.length }
+    content: result.content ?? [{ type: "text", text: `${afterContent.length} bytes` }],
+    details: { ...(result.details ?? {}), unchanged: false, path: absoluteRemote, bytes: afterContent.length }
   };
 }
 
@@ -710,10 +713,7 @@ function sshToolsExtension(pi) {
         0, 0
       );
     },
-    renderResult(result, theme) {
-      const text = result?.content?.[0]?.text || "";
-      return new _piTui.Text(text, 0, 0);
-    }
+    renderResult: readBase.renderResult
   });
 
   pi.registerTool({
@@ -728,18 +728,12 @@ function sshToolsExtension(pi) {
       const abs = _nodePath.isAbsolute(params.path)
         ? params.path
         : joinRemote(target.remoteCwd, params.path);
-      const cmd = `cat -- ${shellQuote(abs)}`;
-      const r = await sshExecVerbose(target.remote, cmd, { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS });
-      const parts = [r.header];
-      if (r.exit === 0) {
-        parts.push(r.stdout.toString("utf8"));
-      } else {
-        parts.push(`[read failed]\n${r.stderr.toString("utf8").trimEnd() || "(no stderr)"}`);
-      }
-      return {
-        content: [{ type: "text", text: parts.join("\n\n") }],
-        details: { exit: r.exit, elapsedMs: r.elapsedMs, path: abs, host: target.remote }
-      };
+      const t0 = Date.now();
+      const tool = _piCodingAgent.createReadToolDefinition(target.remoteCwd, { operations: createRemoteReadOps(target) });
+      const transformed = { ...params, path: abs };
+      const result = await tool.execute(toolCallId, transformed, signal, onUpdate, ctx);
+      ctx.ui.notify(`$ ssh ${target.remote} read ${abs}  ${Date.now() - t0}ms`, "info");
+      return result;
     },
     renderCall(args, theme) {
       const path = typeof args?.path === "string" ? args.path : "...";
@@ -749,10 +743,7 @@ function sshToolsExtension(pi) {
         0, 0
       );
     },
-    renderResult(result, theme) {
-      const text = result?.content?.[0]?.text || "";
-      return new _piTui.Text(text, 0, 0);
-    }
+    renderResult: readBase.renderResult
   });
 
   pi.registerTool({
@@ -767,21 +758,12 @@ function sshToolsExtension(pi) {
       const abs = _nodePath.isAbsolute(params.path)
         ? params.path
         : joinRemote(target.remoteCwd, params.path);
-      const dir = abs.split("/").slice(0, -1).join("/") || "/";
-      const content = typeof params.content === "string" ? params.content : "";
-      const size = Buffer.byteLength(content, "utf8");
-      const cmd = `mkdir -p -- ${shellQuote(dir)} && base64 -d > ${shellQuote(abs)}`;
-      const r = await sshExecVerbose(target.remote, cmd, { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS, stdin: Buffer.from(content, "utf8").toString("base64") } as any);
-      const parts = [r.header];
-      if (r.exit === 0) {
-        parts.push(`wrote ${size} bytes to ${abs}`);
-      } else {
-        parts.push(`[write failed]\n${r.stderr.toString("utf8").trimEnd() || "(no stderr)"}`);
-      }
-      return {
-        content: [{ type: "text", text: parts.join("\n\n") }],
-        details: { exit: r.exit, elapsedMs: r.elapsedMs, bytes: size, path: abs, host: target.remote }
-      };
+      const t0 = Date.now();
+      const tool = _piCodingAgent.createWriteToolDefinition(target.remoteCwd, { operations: createRemoteWriteOps(target) });
+      const transformed = { ...params, path: abs };
+      const result = await tool.execute(toolCallId, transformed, signal, onUpdate, ctx);
+      ctx.ui.notify(`$ ssh ${target.remote} write ${abs}  ${Date.now() - t0}ms`, "info");
+      return result;
     },
     renderCall(args, theme) {
       const path = typeof args?.path === "string" ? args.path : "...";
@@ -791,10 +773,7 @@ function sshToolsExtension(pi) {
         0, 0
       );
     },
-    renderResult(result, theme) {
-      const text = result?.content?.[0]?.text || "";
-      return new _piTui.Text(text, 0, 0);
-    }
+    renderResult: writeBase.renderResult
   });
 
   pi.registerTool({
