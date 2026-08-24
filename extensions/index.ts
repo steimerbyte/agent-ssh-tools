@@ -4,20 +4,16 @@
 // before-activate, verify-block, profile+alias resolver, timeouts, and
 // SHA-256 unchanged-detection. See README for the full feature list.
 
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.default = sshToolsExtension;
+import * as _nodeChild_process from "node:child_process";
+import * as _nodeDns from "node:dns";
+import * as _nodeFs from "node:fs";
+import * as _nodeNet from "node:net";
+import * as _nodeOs from "node:os";
+import * as _nodePath from "node:path";
+import * as _nodeCrypto from "node:crypto";
 
-var _nodeChild_process = await jitiImport("node:child_process");
-var _nodeDns = await jitiImport("node:dns");
-var _nodeFs = await jitiImport("node:fs");
-var _nodeNet = await jitiImport("node:net");
-var _nodeOs = await jitiImport("node:os");
-var _nodePath = await jitiImport("node:path");
-var _nodeCrypto = await jitiImport("node:crypto");
-
-var _piCodingAgent = await jitiImport("@earendil-works/pi-coding-agent");
-var _piTui = await jitiImport("@earendil-works/pi-tui");
+import * as _piCodingAgent from "@earendil-works/pi-coding-agent";
+import * as _piTui from "@earendil-works/pi-tui";
 
 // ---- constants ---------------------------------------------------------
 
@@ -819,4 +815,7 @@ function sshToolsExtension(pi) {
     };
   });
 }
-/* agent-ssh-tools v0.3.0 */
+
+export default sshToolsExtension;
+
+/* agent-ssh-tools v0.5.0 */
