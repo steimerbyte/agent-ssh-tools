@@ -1019,11 +1019,10 @@ function sshToolsExtension(pi) {
       // the user audit destructive remote commands after the fact. Path:
       // ~/.config/agent-ssh-tools/audit.log (atomic append via O_APPEND).
       try {
-        const auditPath = require("node:path").join(_nodeOs.homedir(), ".config", "agent-ssh-tools", "audit.log");
-        require("node:fs").mkdirSync(require("node:path").dirname(auditPath), { recursive: true });
-        const crypto = require("node:crypto");
-        const stdoutHash = crypto.createHash("sha256").update(r.stdout).digest("hex").slice(0, 12);
-        const stderrHash = crypto.createHash("sha256").update(r.stderr).digest("hex").slice(0, 12);
+        const auditPath = _nodePath.join(_nodeOs.homedir(), ".config", "agent-ssh-tools", "audit.log");
+        _nodeFs.mkdirSync(_nodePath.dirname(auditPath), { recursive: true });
+        const stdoutHash = _nodeCrypto.createHash("sha256").update(r.stdout).digest("hex").slice(0, 12);
+        const stderrHash = _nodeCrypto.createHash("sha256").update(r.stderr).digest("hex").slice(0, 12);
         const line = [
           new Date().toISOString(),
           target.name,
@@ -1035,7 +1034,7 @@ function sshToolsExtension(pi) {
           `err=${stderrHash}`,
           JSON.stringify(cmd)
         ].join("\t") + "\n";
-        require("node:fs").appendFileSync(auditPath, line, { flag: "a" });
+        _nodeFs.appendFileSync(auditPath, line, { flag: "a" });
       } catch (e) {
         // Audit failures must not break tool execution.
         ctx?.ui?.notify?.(`audit log write failed: ${(e as any)?.message ?? e}`, "warning");
