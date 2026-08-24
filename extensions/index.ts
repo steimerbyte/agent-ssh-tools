@@ -442,9 +442,23 @@ async function buildVerifyBlock(remote, cwd, seconds = 6) {
   const fp     = fingerprintFor(idFile);
   const t = seconds;
   // Single ssh call with a safe separator. One TCP+auth handshake
-  // instead of three.
+  // instead of three. Use whoami/hostname directly (more portable than
+  // $USER/$HOSTNAME which can be empty in some shells) and run date via
+  // sh -c so $(...) substitution survives ssh-stdin properly.
   const SEP = "@@ssh-cli-verify@@";
-  const cmd = `printf '%s' "$USER"${"${SEP}"}"$HOSTNAME"${"${SEP}"}"$(date -u +%Y-%m-%dT%H:%M:%SZ)"`;
+  // Build the command as a single-quoted bash script. SEP must remain
+  // literal in the remote shell so we can split on it. We use the safe
+  // pattern: `'`, value, `'` -> splits a single-quoted string with
+  // `'`\\''` to insert a literal apostrophe. No JS template literal
+  // interpolation touches the SEP marker.
+  //
+  // bash -c over ssh runs without a login shell so PATH may be empty
+  // — set it explicitly. Use `uname -n` for hostname (universal)
+  // rather than `hostname` (missing on minimal distros/WSL).
+  const q = (v) => "'" + String(v).replace(/'/g, "'\\''") + "'";
+  const cmd =
+    `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ` +
+    `printf '%s\\n' "$(whoami)" ${q(SEP)} "$(uname -n)" ${q(SEP)} "$(date -u +%Y-%m-%dT%H:%M:%SZ)"`;
   let user = "<error>", hostname = "<error>", date = "<error>";
   try {
     const r = await sshExec(remote, cmd, { timeoutSeconds: t });
