@@ -657,6 +657,26 @@ async function execSshEdit(editBase, pi, target, localCwd, params) {
 function sshToolsExtension(pi) {
   let activeTarget = null;
 
+  // CLI flag detection. Pi's argv parser rejects unknown flags, so
+  // the plugin reads an environment variable that wrappers and test
+  // harnesses can set:
+  //
+  //   SSH_CLI_AUTO_ACTIVATE=1 pi -p "ssh_target_select pve-docker"
+  //
+  // When set, the SSH tools are auto-enabled at session_start so the
+  // agent can use them without the user typing /sshactivate first.
+  // Target selection still requires ssh_target_select (probe + verify
+  // runs as usual). /sshactivate off explicitly overrides.
+  const autoActivateFromCli = (() => {
+    try {
+      const fromEnv = process.env.SSH_CLI_AUTO_ACTIVATE === "1";
+      const fromArgv = Array.isArray(process.argv) && process.argv.includes("--ssh-activate");
+      return fromEnv || fromArgv;
+    } catch {
+      return false;
+    }
+  })();
+
   // NOTE: we never pass the local process.cwd() to native tool
   // definitions. The local cwd is irrelevant for remote operations —
   // exposing it would leak where this plugin happens to be installed.
@@ -1068,8 +1088,23 @@ function sshToolsExtension(pi) {
 
   pi.on("session_start", async (_event, ctx) => {
     activeTarget = null;
-    disableSshTools();
-    updateStatus(ctx);
+    if (autoActivateFromCli) {
+      // CLI auto-activation: keep tools enabled across sessions. Status
+      // marks this so the user can see why the tools are on without
+      // having typed /sshactivate.
+      enableSshTools();
+      ctx.ui.setStatus(
+        SSH_STATUS_KEY,
+        ctx.ui.theme.fg("accent", "SSH (auto via SSH_CLI_AUTO_ACTIVATE=1)")
+      );
+      ctx.ui.notify(
+        "SSH tools auto-enabled via SSH_CLI_AUTO_ACTIVATE=1. Call ssh_target_select <host> to pick a target.",
+        "info"
+      );
+    } else {
+      disableSshTools();
+      updateStatus(ctx);
+    }
   });
 
   pi.on("before_agent_start", async event => {
