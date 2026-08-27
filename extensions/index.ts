@@ -970,7 +970,9 @@ function sshToolsExtension(pi) {
     };
 
     // Probe BEFORE setting any state. If probe fails, the user/agent sees
-    // a clear categorized error and activeTarget stays null.
+    // a clear categorized error and activeTarget stays null. Phases are
+    // surfaced via ctx.ui.notify so the user sees progress in the TUI.
+    ctx.ui.notify(`Probing ${profile.remote}...`, "info");
     const r = await probe(profile.remote);
     if (!r.ok) {
       const ipSuffix = r.ip && r.ip !== profile.remote ? ` (${r.ip})` : "";
@@ -978,6 +980,7 @@ function sshToolsExtension(pi) {
       ctx.ui.notify(msg, "warning");
       return { ok: false, reason: r.reason, detail: r.detail, message: msg };
     }
+    ctx.ui.notify(`Auth OK as ${r.user} on ${r.ip || profile.remote}`, "info");
 
     const remoteCwd = await (async () => {
       if (profile.cwd && profile.cwd.trim()) return profile.cwd.trim();
@@ -1139,6 +1142,11 @@ function sshToolsExtension(pi) {
         ? params.path
         : joinRemote(target.remoteCwd, params.path);
       const t0 = Date.now();
+      const content = typeof params.content === "string" ? params.content : "";
+      const size = Buffer.byteLength(content, "utf8");
+      if (size > 64 * 1024) {
+        ctx.ui.notify(`writing ${(size / 1024).toFixed(1)} KB to ${target.remote}:${abs}...`, "info");
+      }
       const tool = _piCodingAgent.createWriteToolDefinition(target.remoteCwd, { operations: createRemoteWriteOps(target) });
       const transformed = { ...params, path: abs };
       const result = await tool.execute(toolCallId, transformed, signal, onUpdate, ctx);
@@ -1171,8 +1179,14 @@ function sshToolsExtension(pi) {
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const target = requireActiveTarget();
       const t0 = Date.now();
+      ctx.ui.notify(`editing ${target.remote}:${params.path}...`, "info");
       const result = await execSshEdit(editBase, pi, target, process.cwd(), params);
-      ctx.ui.notify(`$ ssh ${target.remote} edit ${(result.details as any)?.path ?? params.path}  ${Date.now() - t0}ms`, "info");
+      const details = (result.details ?? {}) as { unchanged?: boolean; path?: string; bytes?: number };
+      if (details.unchanged) {
+        ctx.ui.notify(`edit ${details.path} — no changes (skipped push)`, "info");
+      } else {
+        ctx.ui.notify(`$ ssh ${target.remote} edit ${details.path ?? params.path}  ${Date.now() - t0}ms  ${details.bytes ?? "?"}B`, "info");
+      }
       return result;
     },
     renderCall(args, theme) {
