@@ -258,8 +258,21 @@ function sshExec(remote, command, options = {}) {
         }, options.timeoutSeconds * 1000)
       : undefined;
 
-    child.stdout.on("data", d => { stdoutChunks.push(d); options.onStdoutData?.(d); });
-    child.stderr.on("data", d => { stderrChunks.push(d); options.onStderrData?.(d); });
+    // Live-streaming: pipe stdout/stderr through a throttler that calls
+    // onUpdate() at most every ~150ms with accumulated content. The full
+    // stream is still captured in stdoutChunks/stderrChunks so the
+    // final result.content can include everything.
+    const throttledUpdate = options.onUpdate ? createStreamThrottler(options.onUpdate) : null;
+    child.stdout.on("data", d => {
+      stdoutChunks.push(d);
+      options.onStdoutData?.(d);
+      throttledUpdate?.onChunk(d, "stdout");
+    });
+    child.stderr.on("data", d => {
+      stderrChunks.push(d);
+      options.onStderrData?.(d);
+      throttledUpdate?.onChunk(d, "stderr");
+    });
     if (options.stdin !== undefined) {
       child.stdin.write(options.stdin);
       child.stdin.end();
@@ -268,10 +281,12 @@ function sshExec(remote, command, options = {}) {
     }
     child.on("error", err => {
       if (killTimer) clearTimeout(killTimer);
+      throttledUpdate?.flush();
       reject(err);
     });
     child.on("close", exitCode => {
       if (killTimer) clearTimeout(killTimer);
+      throttledUpdate?.flush();
       if (killed) {
         reject(new Error(`timeout:${options.timeoutSeconds}`));
         return;
@@ -294,6 +309,45 @@ function sshExec(remote, command, options = {}) {
       });
     });
   });
+}
+
+// Stream-throttler: collects stdout/stderr chunks and calls onUpdate at
+// most every THROTTLE_MS. Prevents UI flooding when remote commands
+// emit thousands of small lines (e.g. `tail -f`, `docker pull`).
+function createStreamThrottler(onUpdate) {
+  const THROTTLE_MS = 150;
+  // Visible-buffer cap: don't ship more than ~64KB to the UI at once
+  // to avoid memory blowup on huge outputs. The captured full buffer
+  // remains in the tool's stdoutChunks/stderrChunks for the final
+  // result.content.
+  const VISIBLE_CAP = 64 * 1024;
+  let pendingText = "";
+  let timer = null;
+  let flushed = false;
+  function flush() {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (!pendingText) return;
+    const text = pendingText;
+    pendingText = "";
+    try {
+      onUpdate({
+        content: [{ type: "text", text }],
+        details: { streaming: true }
+      });
+    } catch { /* ignore — UI may be gone */ }
+  }
+  function onChunk(chunk, source) {
+    // Truncate to last VISIBLE_CAP bytes (keep tail) — preserves most
+    // recent output when streams grow long. We don't keep head because
+    // docker pull / tail -f output is more useful as a tail.
+    pendingText += chunk.toString("utf8");
+    if (pendingText.length > VISIBLE_CAP) {
+      pendingText = "…" + pendingText.slice(pendingText.length - VISIBLE_CAP);
+    }
+    if (timer) return;
+    timer = setTimeout(() => { timer = null; flush(); }, THROTTLE_MS);
+  }
+  return { onChunk, flush };
 }
 
 // Format a one-line verbose header that prefixes every ssh_* tool result.
@@ -1169,7 +1223,15 @@ function sshToolsExtension(pi) {
       const cmd = params.command;
       const fullCmd = cwd ? `cd ${shellQuote(cwd)} && ${cmd}` : cmd;
       const t0 = Date.now();
-      const r = await sshExecVerbose(target.remote, fullCmd, { timeoutSeconds: params.timeout ?? 60 });
+      // Forward onUpdate so the tool result streams live. sshExec routes
+      // it through a 150ms-throttler with a 64KB visible-buffer cap so
+      // commands like `docker compose up` (thousands of layer-pull lines)
+      // don't flood the TUI. The final result.content below still holds
+      // the full output — the throttler only feeds intermediate updates.
+      const r = await sshExecVerbose(target.remote, fullCmd, {
+        timeoutSeconds: params.timeout ?? 60,
+        onUpdate
+      });
       const elapsed = Date.now() - t0;
       // Audit log: append-only file with command + target + result. Lets
       // the user audit destructive remote commands after the fact. Path:
