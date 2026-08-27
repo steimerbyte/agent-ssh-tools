@@ -655,18 +655,43 @@ async function scpTransfer(target, direction, source, destination, recursive) {
   } else {
     throw new Error(`ssh_scp: invalid direction '${direction}' (must be 'upload' or 'download')`);
   }
+  // Add -v so scp emits progress + debug on stderr. We parse the
+  // transfer-rate / ETA / bytes lines for the tool result so the user
+  // sees speed and progress, not just exit code.
+  const verboseArgs = [...args, "-v"];
   return new Promise((resolve) => {
     const t0 = Date.now();
-    const child = _nodeChild_process.spawn("scp", args, { stdio: ["pipe", "pipe", "pipe"] });
+    const child = _nodeChild_process.spawn("scp", verboseArgs, { stdio: ["pipe", "pipe", "pipe"] });
     const outChunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
+    // Capture progress lines (stderr from -v) so we can summarise.
+    // scp -v output ends with a line like:
+    //   "Transferred: sent 4056, received 4608 bytes, in 0.5 seconds"
+    //   "Bytes per second: sent 7612.8, received 8648.9"
+    let sentBytes = null, receivedBytes = null;
+    let elapsedSec = null, sentBps = null, receivedBps = null;
     let killed = false;
     const killTimer = setTimeout(() => {
       killed = true;
       try { child.kill("SIGKILL"); } catch {}
     }, DEFAULT_SSH_TIMEOUT_SECONDS * 1000);
     child.stdout.on("data", d => outChunks.push(d));
-    child.stderr.on("data", d => errChunks.push(d));
+    child.stderr.on("data", d => {
+      errChunks.push(d);
+      const text = d.toString("utf8");
+      // Parse transfer-summary lines emitted near the end of scp -v.
+      const m1 = text.match(/Transferred:\s*sent\s*(\d+),\s*received\s*(\d+)\s*bytes,\s*in\s*([\d.]+)\s*seconds/);
+      if (m1) {
+        sentBytes = parseInt(m1[1], 10);
+        receivedBytes = parseInt(m1[2], 10);
+        elapsedSec = parseFloat(m1[3]);
+      }
+      const m2 = text.match(/Bytes per second:\s*sent\s*([\d.]+),\s*received\s*([\d.]+)/);
+      if (m2) {
+        sentBps = parseFloat(m2[1]);
+        receivedBps = parseFloat(m2[2]);
+      }
+    });
     child.stdin.end();
     child.on("error", err => {
       clearTimeout(killTimer);
@@ -697,7 +722,8 @@ async function scpTransfer(target, direction, source, destination, recursive) {
       resolve({
         exitCode: code ?? 0, stdout, stderr,
         elapsedMs: Date.now() - t0,
-        sourceSha256: srcSha, destinationSha256: dstSha, truncated
+        sourceSha256: srcSha, destinationSha256: dstSha, truncated,
+        sentBytes, receivedBytes, elapsedSec, sentBps, receivedBps
       });
     });
   });
@@ -1325,6 +1351,17 @@ function sshToolsExtension(pi) {
         if (r.stderr.length) parts.push(r.stderr.toString("utf8").trimEnd());
       } else {
         parts.push(`scp ${params.direction} ok  ${r.elapsedMs}ms`);
+        // Speed/progress from scp -v summary line. Falls back gracefully
+        // if scp didn't emit the line (older versions or no -v flag).
+        if (r.sentBytes !== null && r.receivedBytes !== null) {
+          parts.push(`bytes  sent=${r.sentBytes}  received=${r.receivedBytes}`);
+        }
+        if (r.sentBps !== null && r.receivedBps !== null) {
+          parts.push(`speed  sent=${r.sentBps.toFixed(0)}B/s  received=${r.receivedBps.toFixed(0)}B/s`);
+        }
+        if (r.elapsedSec !== null) {
+          parts.push(`time   ${r.elapsedSec.toFixed(2)}s`);
+        }
         if (r.sourceSha256 && r.destinationSha256) {
           parts.push(`sha256  src=${r.sourceSha256.slice(0,12)}  dst=${r.destinationSha256.slice(0,12)}  ${sha256Match ? "MATCH" : "MISMATCH"}`);
         }
@@ -1338,7 +1375,12 @@ function sshToolsExtension(pi) {
           source: params.source,
           destination: params.destination,
           host: target.remote,
-          bytes: r.elapsedMs,
+          elapsed_ms: r.elapsedMs,
+          sent_bytes: r.sentBytes,
+          received_bytes: r.receivedBytes,
+          sent_bps: r.sentBps,
+          received_bps: r.receivedBps,
+          transfer_time_seconds: r.elapsedSec,
           sha256_match: sha256Match,
           sha256_source: r.sourceSha256,
           sha256_destination: r.destinationSha256
