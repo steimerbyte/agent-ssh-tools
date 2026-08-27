@@ -610,8 +610,28 @@ function createRemoteBashOps(target) {
 // destinationSha256, truncated}. The caller verifies the two hashes
 // match when both ends are regular files (recursive directories get
 // empty hashes).
+// Decide whether scp's `-C` (ssh-stream compression) is worth the CPU.
+// Text-like extensions compress well; binaries don't. We never enable
+// `-C` for binary types or unknown extensions (compress-then-encrypt
+// is slower for already-compressed data).
+const COMPRESSIBLE_EXT = new Set([
+  "", ".txt", ".log", ".md", ".rst", ".csv", ".tsv", ".json", ".xml",
+  ".yaml", ".yml", ".toml", ".ini", ".conf", ".cfg", ".html", ".css",
+  ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs", ".py", ".rb", ".go",
+  ".rs", ".java", ".kt", ".scala", ".c", ".h", ".cpp", ".hpp", ".cs",
+  ".sh", ".bash", ".zsh", ".fish", ".sql", ".tex", ".mdx", ".vue", ".svelte"
+]);
+function isCompressiblePath(p) {
+  const idx = p.lastIndexOf(".");
+  // No extension = unknown, default to compressible (small files win)
+  if (idx < 0 || idx < p.lastIndexOf("/")) return true;
+  return COMPRESSIBLE_EXT.has(p.slice(idx).toLowerCase());
+}
+
 async function scpTransfer(target, direction, source, destination, recursive) {
-  const recFlag = recursive ? "-r" : "";
+  const flags = [];
+  if (recursive) flags.push("-r");
+  if (isCompressiblePath(direction === "upload" ? source : source)) flags.push("-C");
   let args;
   if (direction === "upload") {
     // local -> remote. We symlink-check the destination up front; if the
@@ -628,10 +648,10 @@ async function scpTransfer(target, direction, source, destination, recursive) {
       }
       throw e;
     }
-    args = [recFlag, source, `${target.remote}:${destination}`];
+    args = [...flags, source, `${target.remote}:${destination}`];
   } else if (direction === "download") {
     // remote -> local
-    args = [recFlag, `${target.remote}:${source}`, destination];
+    args = [...flags, `${target.remote}:${source}`, destination];
   } else {
     throw new Error(`ssh_scp: invalid direction '${direction}' (must be 'upload' or 'download')`);
   }
