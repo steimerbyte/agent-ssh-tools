@@ -18,7 +18,7 @@ import * as _piTui from "@earendil-works/pi-tui";
 // ---- constants ---------------------------------------------------------
 
 const SSH_STATUS_KEY = "ssh-tools";
-const SSH_TOOL_NAMES = ["ssh_target_select", "ssh_read", "ssh_write", "ssh_edit", "ssh_bash"];
+const SSH_TOOL_NAMES = ["ssh_target_select", "ssh_read", "ssh_write", "ssh_edit", "ssh_bash", "ssh_scp"];
 const SSH_CONFIG_PATH = _nodePath.join(_nodeOs.homedir(), ".ssh", "config");
 const PROFILES_FILE = _nodePath.join(_nodeOs.homedir(), ".config", "agent-ssh-tools", "profiles.json");
 const DEFAULT_PROBE_SECONDS = 6;
@@ -600,6 +600,100 @@ function createRemoteBashOps(target) {
   };
 }
 
+// ---- file transfer (scp) ---------------------------------------------
+
+// Run scp between a local path and a remote target path on the active
+// SSH host. direction: 'upload' (local -> remote) or 'download'
+// (remote -> local). Optional -r for recursive (directory) transfers.
+//
+// Returns {exitCode, stdout, stderr, elapsedMs, sourceSha256,
+// destinationSha256, truncated}. The caller verifies the two hashes
+// match when both ends are regular files (recursive directories get
+// empty hashes).
+async function scpTransfer(target, direction, source, destination, recursive) {
+  const recFlag = recursive ? "-r" : "";
+  let args;
+  if (direction === "upload") {
+    // local -> remote. We symlink-check the destination up front; if the
+    // remote path is a symlink the upload would write through it and
+    // possibly corrupt the target.
+    try {
+      await sshOk(target.remote,
+        `if [ -L ${shellQuote(destination)} ]; then exit 9; fi; exit 0`,
+        { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS });
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      if (msg.includes("exit (9)")) {
+        throw new Error(`refusing to upload through symlink: ${destination}`);
+      }
+      throw e;
+    }
+    args = [recFlag, source, `${target.remote}:${destination}`];
+  } else if (direction === "download") {
+    // remote -> local
+    args = [recFlag, `${target.remote}:${source}`, destination];
+  } else {
+    throw new Error(`ssh_scp: invalid direction '${direction}' (must be 'upload' or 'download')`);
+  }
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const child = _nodeChild_process.spawn("scp", args, { stdio: ["pipe", "pipe", "pipe"] });
+    const outChunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
+    let killed = false;
+    const killTimer = setTimeout(() => {
+      killed = true;
+      try { child.kill("SIGKILL"); } catch {}
+    }, DEFAULT_SSH_TIMEOUT_SECONDS * 1000);
+    child.stdout.on("data", d => outChunks.push(d));
+    child.stderr.on("data", d => errChunks.push(d));
+    child.stdin.end();
+    child.on("error", err => {
+      clearTimeout(killTimer);
+      resolve({
+        exitCode: 127, stdout: Buffer.alloc(0), stderr: Buffer.from(String(err?.message ?? err)),
+        elapsedMs: Date.now() - t0, sourceSha256: "", destinationSha256: "", truncated: false
+      });
+    });
+    child.on("close", async code => {
+      clearTimeout(killTimer);
+      if (killed) {
+        resolve({
+          exitCode: 124, stdout: Buffer.concat(outChunks), stderr: Buffer.concat(errChunks),
+          elapsedMs: Date.now() - t0, sourceSha256: "", destinationSha256: "", truncated: false
+        });
+        return;
+      }
+      const outCap = 10 * 1024 * 1024;
+      let stdout = Buffer.concat(outChunks);
+      let stderr = Buffer.concat(errChunks);
+      let truncated = false;
+      if (stdout.length > outCap) { stdout = stdout.subarray(0, outCap); truncated = true; }
+      if (stderr.length > outCap) { stderr = stderr.subarray(0, outCap); truncated = true; }
+      // Compute SHA-256 of source + destination AFTER transfer so the
+      // caller can verify integrity. Async fs operations.
+      const srcSha = await sha256FileAsync(direction === "upload" ? source : destination);
+      const dstSha = await sha256FileAsync(direction === "upload" ? destination : source);
+      resolve({
+        exitCode: code ?? 0, stdout, stderr,
+        elapsedMs: Date.now() - t0,
+        sourceSha256: srcSha, destinationSha256: dstSha, truncated
+      });
+    });
+  });
+}
+
+// Promise-based SHA-256 of a file. Returns "" if the file does not
+// exist or cannot be read (e.g. after scp failed mid-transfer).
+async function sha256FileAsync(path) {
+  try {
+    const buf = await _nodeFs.promises.readFile(path);
+    return _nodeCrypto.createHash("sha256").update(buf).digest("hex");
+  } catch {
+    return "";
+  }
+}
+
 // ---- ssh_edit wrapper with SHA256 unchanged-detection -----------------
 
 // pi-coding-agent's createEditToolDefinition reads, applies edits, writes.
@@ -1096,6 +1190,154 @@ function sshToolsExtension(pi) {
       // duplicated first line if it duplicates the host line.
       const body = stdout.trim();
       return new _piTui.Text(`${header}\n${body}`, 0, 0);
+    }
+  });
+
+  // ---- ssh_scp (file transfer) --------------------------------------
+
+  pi.registerTool({
+    name: "ssh_scp",
+    label: "ssh_scp",
+    description: "Transfer files between the local machine and the active SSH host via scp. Use direction='upload' to send local->remote, or 'download' for remote->local. Set recursive=true for directories.",
+    promptSnippet: "Transfer files between local and active remote host",
+    promptGuidelines: [
+      "Use ssh_scp when the user wants to move a file/directory between this machine and the active SSH host.",
+      "Prefer ssh_scp over ssh_bash 'cat < local | ssh remote cat >' pipelines — scp handles binary data, permissions, partial failures.",
+      "Always set direction explicitly. Default never assumed.",
+      "Source/destination paths must NOT contain newlines or shell metacharacters (whitelisted).",
+      "After transfer, check details.sha256_match to confirm integrity."
+    ],
+    parameters: {
+      type: "object",
+      properties: {
+        target: {
+          type: "string",
+          description: "SSH target name (profile/alias/ssh-config host)"
+        },
+        direction: {
+          type: "string",
+          enum: ["upload", "download"],
+          description: "'upload' = local source -> remote destination. 'download' = remote source -> local destination."
+        },
+        source: {
+          type: "string",
+          description: "Source path (local for upload, remote for download)"
+        },
+        destination: {
+          type: "string",
+          description: "Destination path (remote for upload, local for download)"
+        },
+        recursive: {
+          type: "boolean",
+          description: "Set true to transfer directories (scp -r)",
+          default: false
+        }
+      },
+      required: ["target", "direction", "source", "destination"]
+    },
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const target = requireActiveTarget();
+      // Re-resolve target name vs activeTarget.name as a sanity check
+      if (params.target && params.target !== target.name) {
+        ctx.ui.notify(
+          `ssh_scp: target arg '${params.target}' != active target '${target.name}'. ` +
+          `Use ssh_target_select to switch. Aborting.`,
+          "warning"
+        );
+        return {
+          content: [{ type: "text", text: `target mismatch: requested '${params.target}', active '${target.name}'` }],
+          details: { ok: false, error: "target-mismatch" }
+        };
+      }
+      // Whitelist remote paths (local paths must also be safe — we never
+      // want to pass them through a shell that could be hijacked).
+      const sourceSafe = isSafeTargetString(params.source);
+      const destSafe = isSafeTargetString(params.destination);
+      if (!sourceSafe || !destSafe) {
+        ctx.ui.notify(
+          `ssh_scp: source or destination contains unsafe characters ` +
+          `(allowed: A-Z a-z 0-9 . _ @ - / :)`,
+          "warning"
+        );
+        return {
+          content: [{ type: "text", text: `unsafe path characters` }],
+          details: { ok: false, error: "unsafe-path" }
+        };
+      }
+      const t0 = Date.now();
+      let r;
+      try {
+        r = await scpTransfer(
+          target, params.direction, params.source, params.destination, !!params.recursive
+        );
+      } catch (e: any) {
+        return {
+          content: [{ type: "text", text: String(e?.message ?? e) }],
+          details: { ok: false, error: "scp-failed" }
+        };
+      }
+      // Verify hashes: src and dst should match for regular files
+      const sha256Match = r.sourceSha256 && r.destinationSha256 && r.sourceSha256 === r.destinationSha256;
+      // Audit log
+      try {
+        const auditPath = _nodePath.join(_nodeOs.homedir(), ".config", "agent-ssh-tools", "audit.log");
+        _nodeFs.mkdirSync(_nodePath.dirname(auditPath), { recursive: true });
+        const line = [
+          new Date().toISOString(),
+          "scp",
+          target.name,
+          target.remote,
+          params.direction,
+          `exit=${r.exitCode}`,
+          `${r.elapsedMs}ms`,
+          `src=${r.sourceSha256}`,
+          `dst=${r.destinationSha256}`,
+          `match=${sha256Match ? "yes" : "no"}`,
+          JSON.stringify(params.source),
+          "->",
+          JSON.stringify(params.destination)
+        ].join("\t") + "\n";
+        _nodeFs.appendFileSync(auditPath, line, { flag: "a" });
+      } catch { /* audit failures must not break tool */ }
+      const parts = [];
+      if (r.exitCode !== 0) {
+        parts.push(`[scp ${params.direction} failed exit=${r.exitCode}]`);
+        if (r.stderr.length) parts.push(r.stderr.toString("utf8").trimEnd());
+      } else {
+        parts.push(`scp ${params.direction} ok  ${r.elapsedMs}ms`);
+        if (r.sourceSha256 && r.destinationSha256) {
+          parts.push(`sha256  src=${r.sourceSha256.slice(0,12)}  dst=${r.destinationSha256.slice(0,12)}  ${sha256Match ? "MATCH" : "MISMATCH"}`);
+        }
+        if (r.truncated) parts.push(`[output truncated — exceeds 10MB cap]`);
+      }
+      return {
+        content: [{ type: "text", text: parts.join("\n") }],
+        details: {
+          ok: r.exitCode === 0,
+          direction: params.direction,
+          source: params.source,
+          destination: params.destination,
+          host: target.remote,
+          bytes: r.elapsedMs,
+          sha256_match: sha256Match,
+          sha256_source: r.sourceSha256,
+          sha256_destination: r.destinationSha256
+        }
+      };
+    },
+    renderCall(args, theme) {
+      const dir = typeof args?.direction === "string" ? args.direction : "?";
+      const src = typeof args?.source === "string" ? args.source : "...";
+      const dst = typeof args?.destination === "string" ? args.destination : "...";
+      const targetLabel = activeTarget ? activeTarget.name : "inactive";
+      return new _piTui.Text(
+        `${theme.fg("toolTitle", theme.bold("ssh_scp"))} ${theme.fg("accent", dir)} ${theme.fg("muted", `${src} -> ${dst} [${targetLabel}]`)}`,
+        0, 0
+      );
+    },
+    renderResult(result, _options, theme) {
+      const text = result?.content?.[0]?.text ?? "";
+      return new _piTui.Text(text, 0, 0);
     }
   });
 

@@ -6,7 +6,7 @@
 ## Install
 
 ```sh
-pi install npm:@ogulcancelik/agent-ssh-tools
+pi install npm:<npm-name>
 ```
 
 ## Tools and commands
@@ -110,7 +110,7 @@ verify:
   user:     root
   hostname: web01.example.com
   cwd:      /var/www
-  key:      SHA256:dL8XuLs6rIr9oU654W7PcQUriY77b+FEVb88yJp+jyg  (/home/steimerbyte/.ssh/id_ed25519)
+  key:      SHA256:abc123…  (/home/<user>/.ssh/id_<algo>)
   date:     2026-08-24T16:54:28Z
 ```
 
