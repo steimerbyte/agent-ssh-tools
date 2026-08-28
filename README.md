@@ -6,7 +6,7 @@
 ## Install
 
 ```sh
-pi install npm:<npm-name>
+pi install npm:@steimerbyte/agent-ssh-tools
 ```
 
 ## Tools and commands
@@ -203,16 +203,20 @@ remote cwd**, not the local process cwd. Matches the intuition: "I said
 | `~/.config/agent-ssh-tools/profiles.json` | profiles + aliases |
 | `~/.ssh/config` | auto-discovered hosts (read-only) |
 
-## Inspiration
+## Credits
 
-This extension was inspired by the original `pi-ssh-tools` plugin (the
-four-tool pattern of `ssh_read`/`ssh_write`/`ssh_edit`/`ssh_bash` plus
-the user-initiated activation command comes from there). The agent-safety
-layer — probe-before-activate, verify block, SHA-256 unchanged-detection,
-agent-callable target switch — was added because real AI agents routinely
-mis-target hosts, mis-name files, and re-run edits without realizing the
-first run already succeeded. None of that is a critique of the original;
-the safety layer is meant to be added on top of any working SSH plugin.
+The original `pi-ssh-tools` plugin — including the four-tool pattern of
+`ssh_read` / `ssh_write` / `ssh_edit` / `ssh_bash` and the user-initiated
+activation command — was written by **ogulcancelik (Can Celik)**. This
+project is a fork of that original work, continued and extended by
+**steimerbyte**.
+
+The agent-safety layer — probe-before-activate, verify block, SHA-256
+unchanged-detection, agent-callable target switch — was added because
+real AI agents routinely mis-target hosts, mis-name files, and re-run
+edits without realizing the first run already succeeded. None of that
+is a critique of the original; the safety layer is meant to be added on
+top of any working SSH plugin.
 
 ## License
 
