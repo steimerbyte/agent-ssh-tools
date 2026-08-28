@@ -683,7 +683,10 @@ function isCompressiblePath(p) {
 }
 
 async function scpTransfer(target, direction, source, destination, recursive) {
-  const flags = [];
+  // -v must come BEFORE source paths; if it comes after, scp interprets
+  // it as another filename and fails with "No such file or directory".
+  // We always want -v for the transfer-summary parse.
+  const flags = ["-v"];
   if (recursive) flags.push("-r");
   if (isCompressiblePath(direction === "upload" ? source : source)) flags.push("-C");
   let args;
@@ -709,13 +712,9 @@ async function scpTransfer(target, direction, source, destination, recursive) {
   } else {
     throw new Error(`ssh_scp: invalid direction '${direction}' (must be 'upload' or 'download')`);
   }
-  // Add -v so scp emits progress + debug on stderr. We parse the
-  // transfer-rate / ETA / bytes lines for the tool result so the user
-  // sees speed and progress, not just exit code.
-  const verboseArgs = [...args, "-v"];
   return new Promise((resolve) => {
     const t0 = Date.now();
-    const child = _nodeChild_process.spawn("scp", verboseArgs, { stdio: ["pipe", "pipe", "pipe"] });
+    const child = _nodeChild_process.spawn("scp", args, { stdio: ["pipe", "pipe", "pipe"] });
     const outChunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
     // Capture progress lines (stderr from -v) so we can summarise.
@@ -1320,12 +1319,13 @@ function sshToolsExtension(pi) {
   pi.registerTool({
     name: "ssh_scp",
     label: "ssh_scp",
-    description: "Transfer files between the local machine and the active SSH host via scp. Use direction='upload' to send local->remote, or 'download' for remote->local. Set recursive=true for directories.",
+    description: "Transfer files between the local machine and the active SSH host via scp. Use direction='upload' to send local->remote, or 'download' for remote->local. Set recursive=true for directories. The target param is optional — defaults to the currently-active ssh target.",
     promptSnippet: "Transfer files between local and active remote host",
     promptGuidelines: [
       "Use ssh_scp when the user wants to move a file/directory between this machine and the active SSH host.",
       "Prefer ssh_scp over ssh_bash 'cat < local | ssh remote cat >' pipelines — scp handles binary data, permissions, partial failures.",
-      "Always set direction explicitly. Default never assumed.",
+      "Direction accepts aliases: upload/push/send/to  → local→remote; download/pull/get/fetch/from → remote→local.",
+      "Target param is optional — omit it to use the currently-active target.",
       "Source/destination paths must NOT contain newlines or shell metacharacters (whitelisted).",
       "After transfer, check details.sha256_match to confirm integrity."
     ],
@@ -1334,12 +1334,12 @@ function sshToolsExtension(pi) {
       properties: {
         target: {
           type: "string",
-          description: "SSH target name (profile/alias/ssh-config host)"
+          description: "SSH target name (profile/alias/ssh-config host). Optional — defaults to active target."
         },
         direction: {
           type: "string",
-          enum: ["upload", "download"],
-          description: "'upload' = local source -> remote destination. 'download' = remote source -> local destination."
+          description: "'upload'/'push'/'send'/'to' = local source → remote destination. 'download'/'pull'/'get'/'fetch'/'from' = remote source → local destination. Defaults to 'upload' if source is local and destination is remote (heuristic).",
+          default: "upload"
         },
         source: {
           type: "string",
@@ -1355,11 +1355,12 @@ function sshToolsExtension(pi) {
           default: false
         }
       },
-      required: ["target", "direction", "source", "destination"]
+      required: ["source", "destination"]
     },
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const target = requireActiveTarget();
-      // Re-resolve target name vs activeTarget.name as a sanity check
+      // Resolve target: explicit param overrides; otherwise use active target.
+      const requestedTarget = params.target || target.name;
       if (params.target && params.target !== target.name) {
         ctx.ui.notify(
           `ssh_scp: target arg '${params.target}' != active target '${target.name}'. ` +
@@ -1371,6 +1372,26 @@ function sshToolsExtension(pi) {
           details: { ok: false, error: "target-mismatch" }
         };
       }
+      // Normalize direction aliases: upload/push/send/to ↔ download/pull/get/fetch/from
+      const dirRaw = String(params.direction || "upload").toLowerCase().trim();
+      const dirMap: Record<string, string> = {
+        "upload": "upload", "push": "upload", "send": "upload", "to": "upload", "up": "upload",
+        "download": "download", "pull": "download", "get": "download", "fetch": "download",
+        "from": "download", "down": "download"
+      };
+      const direction = dirMap[dirRaw];
+      if (!direction) {
+        return {
+          content: [{ type: "text", text:
+            `ssh_scp: invalid direction '${params.direction}'. Use 'upload' or 'download' ` +
+            `(aliases: push/send/to ↔ pull/get/fetch/from).` }],
+          details: { ok: false, error: "invalid-direction" }
+        };
+      }
+      // Heuristic default: if direction arg is omitted but paths look like
+      // local→remote, infer upload. Detection: source exists on local fs.
+      // This never overrides an explicit direction.
+      // (Heuristic intentionally skipped — explicit > smart. User can pass 'upload' or 'download'.)
       // Whitelist remote paths (local paths must also be safe — we never
       // want to pass them through a shell that could be hijacked).
       const sourceSafe = isSafeTargetString(params.source);
@@ -1385,6 +1406,32 @@ function sshToolsExtension(pi) {
           content: [{ type: "text", text: `unsafe path characters` }],
           details: { ok: false, error: "unsafe-path" }
         };
+      }
+      // For upload: confirm source exists locally before invoking scp
+      // (scp's error message 'No such file or directory' without the
+      // filename is ambiguous and hard to debug).
+      if (direction === "upload") {
+        try {
+          const st = _nodeFs.statSync(params.source);
+          if (!st.isFile() && !st.isDirectory()) {
+            return {
+              content: [{ type: "text", text:
+                `ssh_scp: source '${params.source}' is not a regular file or directory` }],
+              details: { ok: false, error: "source-not-file" }
+            };
+          }
+          // If local source is a directory, recursive must be true.
+          if (st.isDirectory() && !params.recursive) {
+            ctx.ui.notify(`ssh_scp: source is a directory — auto-setting recursive=true`, "info");
+            params = { ...params, recursive: true };
+          }
+        } catch (e: any) {
+          return {
+            content: [{ type: "text", text:
+              `ssh_scp: local source not found: ${params.source} (${e?.code ?? e?.message ?? e})` }],
+            details: { ok: false, error: "source-missing", source: params.source }
+          };
+        }
       }
       const t0 = Date.now();
       let r;
@@ -1422,9 +1469,22 @@ function sshToolsExtension(pi) {
         _nodeFs.appendFileSync(auditPath, line, { flag: "a" });
       } catch { /* audit failures must not break tool */ }
       const parts = [];
+      // Surface the actual scp command in the result so debugging is
+      // trivial: copy-paste the scp line and it works.
+      parts.push(`$ scp ${args.join(" ")}`);
       if (r.exitCode !== 0) {
-        parts.push(`[scp ${params.direction} failed exit=${r.exitCode}]`);
-        if (r.stderr.length) parts.push(r.stderr.toString("utf8").trimEnd());
+        parts.push(`[scp ${direction} failed exit=${r.exitCode}]`);
+        // scp emits diagnostics on stderr ('debug1: ...', 'scp: No such
+        // file...'). Always surface stderr in failure cases so the agent
+        // sees the actual error instead of a generic exit-code message.
+        if (r.stderr.length) {
+          const stderrText = r.stderr.toString("utf8").trimEnd();
+          // Keep stderr to last ~4KB to avoid flooding output
+          const tail = stderrText.length > 4096
+            ? "…\n" + stderrText.slice(stderrText.length - 4096)
+            : stderrText;
+          parts.push(tail);
+        }
       } else {
         parts.push(`scp ${params.direction} ok  ${r.elapsedMs}ms`);
         // Speed/progress from scp -v summary line. Falls back gracefully
