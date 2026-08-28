@@ -1,5 +1,5 @@
 {
-  "name": "@ogulcancelik/agent-ssh-tools",
+  "name": "@steimerbyte/agent-ssh-tools",
   "version": "0.5.0",
   "description": "Pi coding-agent SSH extension with agent-safety: probe-before-activate, verify block, profile+alias resolver, SHA-256 unchanged-detection.",
   "keywords": [
