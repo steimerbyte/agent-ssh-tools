@@ -189,6 +189,7 @@ function normalizeTargetArg(arg) {
   // alias via `ssh -G <alias>` instead of DNS. The resolved hostname from
   // ssh -G becomes the `remote` for TCP-connect and ssh-whoami.
   let sshConfigAlias;
+  let _sshTrace;
   if (sshCfg) {
     remote = sshCfg.remote;
     cwd    = safeCwd(inlineCwd) || safeCwd(prof ? prof.cwd : undefined);
@@ -197,6 +198,34 @@ function normalizeTargetArg(arg) {
     cwd    = safeCwd(inlineCwd) || safeCwd(prof.cwd);
     // Carry sshConfigAlias through so probe() can use it instead of DNS.
     sshConfigAlias = (prof.sshConfigAlias && isSafeTargetString(prof.sshConfigAlias)) ? prof.sshConfigAlias : undefined;
+    // Resolve hostname via ssh -G so downstream ssh calls (buildVerifyBlock,
+    // ssh_bash, ssh_read, etc.) use the IP instead of the profile name.
+    if (sshConfigAlias) {
+      try {
+        const r = _nodeChild_process.spawnSync(
+          "ssh", ["-G", sshConfigAlias],
+          { encoding: "utf8", timeout: 5000 }
+        );
+        if (r.status === 0) {
+          const lines = r.stdout.split("\n").reduce((acc, l) => {
+            const kv = l.trim().split(/\s+/);
+            if (kv.length >= 2) acc[kv[0].toLowerCase()] = kv.slice(1).join(" ");
+            return acc;
+          }, {} as Record<string, string>);
+          const resolvedHost = lines.hostname || sshConfigAlias;
+          if (isSafeTargetString(resolvedHost)) {
+            _sshTrace = `[ssh-ts] ssh -G ${sshConfigAlias} → hostname=${resolvedHost} (was ${remote})`;
+            remote = resolvedHost;
+          } else {
+            _sshTrace = `[ssh-ts] ssh -G ${sshConfigAlias} → hostname=${resolvedHost} REJECTED by isSafeTargetString`;
+          }
+        } else {
+          _sshTrace = `[ssh-ts] ssh -G ${sshConfigAlias} failed status=${r.status} stderr=${r.stderr?.toString().slice(0,200)}`;
+        }
+      } catch (e) {
+        _sshTrace = `[ssh-ts] ssh -G ${sshConfigAlias} threw: ${e.message}`;
+      }
+    }
   } else {
     // No profile, no alias, no ssh-config Host block. Do NOT silently
     // pass this through to ssh(1) — the user probably mistyped or the
@@ -214,7 +243,9 @@ function normalizeTargetArg(arg) {
   // an unsafe cwd, drop it.
   if (cwd && !isSafeTargetString(cwd)) cwd = undefined;
 
-  return { name: resolved, remote, cwd, untrusted: false, sshConfigAlias };
+  const result = { name: resolved, remote, cwd, untrusted: false, sshConfigAlias };
+  if (_sshTrace) result._sshTrace = _sshTrace;
+  return result;
 }
 
 // Human-readable list of available targets for error messages.
@@ -243,10 +274,17 @@ function sshCliAvailableTargets(): string {
 // can build their own verbose headers from these primitives.
 function sshExec(remote, command, options = {}) {
   return new Promise((resolve, reject) => {
-    const args = [];
+    // Always enforce key-only auth to prevent ssh_askpass hang on wrong user/key.
+    const args = [
+      "-o", "BatchMode=yes",
+      "-o", "PreferredAuthentications=publickey"
+    ];
     if (typeof options.timeoutSeconds === "number" && options.timeoutSeconds > 0) {
       args.push("-o", `ConnectTimeout=${options.timeoutSeconds}`);
     }
+    if (options.identityFile && isSafeTargetString(options.identityFile)) args.push("-i", options.identityFile);
+    if (options.user         && isSafeTargetString(options.user))         args.push("-l", options.user);
+    if (typeof options.port === "number" && options.port !== 22)          args.push("-p", String(options.port));
     args.push(remote, command);
 
     const child = _nodeChild_process.spawn("ssh", args, {
@@ -561,25 +599,24 @@ function fingerprintFor(keyPath) {
 async function buildVerifyBlock(target, cwd, seconds = 6, sshConfigAlias?: string) {
   const remote = target.remote;
   const profileName = target.name;
-  // Use sshConfigAlias for identity-file lookup so ssh -G resolves the
-  // correct key. Without it, identityFileFor(remote=IP) falls back to id_rsa
-  // because the IP has no matching ~/.ssh/config Host block.
-  const idFile = identityFileFor(sshConfigAlias || remote);
+  // Prefer resolved identity/user/port over identityFileFor (which only
+  // works for ~/.ssh/config host names, not raw IPs).
+  const idFile = target.identityFile || identityFileFor(sshConfigAlias || remote);
   const fp     = fingerprintFor(idFile);
   const t = seconds;
   const SEP = "@@ssh-cli-verify@@";
   const q = (v) => "'" + String(v).replace(/'/g, "'\\''") + "'";
-  // Compare what the user/agent THINKS they are connecting to (ssh-cli
-  // arg, which is `remote`) with what the machine REPORTS (`uname -n`).
-  // A poisonable profile would map `pve-docker` (familiar name) to a
-  // different host; if those two strings disagree, the user/agent
-  // sees a MISMATCH warning.
   const cmd =
     `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ` +
     `printf '%s\\n' "$(whoami)" ${q(SEP)} "$(uname -n)" ${q(SEP)} "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ${q(SEP)} "${q(profileName)}"`;
   let user = "<error>", hostname = "<error>", date = "<error>", aliasEcho = "<error>";
   try {
-    const r = await sshExec(remote, cmd, { timeoutSeconds: t });
+    const r = await sshExec(remote, cmd, {
+      timeoutSeconds: t,
+      identityFile: target.identityFile,
+      user: target.user,
+      port: target.port
+    });
     if (r.exitCode === 0) {
       const parts = r.stdout.toString("utf8").trim().split(SEP);
       if (parts.length >= 4) {
@@ -627,22 +664,35 @@ function inferImageMimeType(path) {
 
 function createRemoteReadOps(target) {
   return {
-    readFile: (absolutePath) => sshOk(target.remote, `cat ${shellQuote(absolutePath)}`, { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS }),
-    access:   (absolutePath) => sshOk(target.remote, `test -r ${shellQuote(absolutePath)}`, { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS }).then(() => {}),
+    readFile: (absolutePath) => sshOk(target.remote, `cat ${shellQuote(absolutePath)}`, {
+      timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS,
+      identityFile: target.identityFile,
+      user: target.user,
+      port: target.port
+    }),
+    access: (absolutePath) => sshOk(target.remote, `test -r ${shellQuote(absolutePath)}`, {
+      timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS,
+      identityFile: target.identityFile,
+      user: target.user,
+      port: target.port
+    }).then(() => {}),
     detectImageMimeType: async (absolutePath) => inferImageMimeType(absolutePath)
   };
 }
 
 function createRemoteWriteOps(target) {
+  const opts = {
+    timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS,
+    identityFile: target.identityFile,
+    user: target.user,
+    port: target.port
+  };
   return {
     writeFile: async (absolutePath, content) => {
-      // Symlink check: reject writes if the target path is a symlink.
-      // readlink -f resolves the canonical target; we block when the
-      // path exists AND points elsewhere (so missing-file writes still work).
       try {
         await sshOk(target.remote,
           `if [ -L ${shellQuote(absolutePath)} ]; then p=$(readlink -f ${shellQuote(absolutePath)}); echo "SYMLINK $p"; exit 9; fi; exit 0`,
-          { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS });
+          opts);
       } catch (e) {
         const msg = String((e as any)?.message ?? e);
         if (msg.includes("exit (9)")) {
@@ -650,13 +700,15 @@ function createRemoteWriteOps(target) {
         }
         throw e;
       }
-      // Real write: send content via stdin to a cat-heredoc-shell-quoted path
       await sshOk(target.remote, `cat > ${shellQuote(absolutePath)}`, {
         timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS,
-        stdin: content
+        stdin: content,
+        identityFile: target.identityFile,
+        user: target.user,
+        port: target.port
       });
     },
-    mkdir: (dir) => sshOk(target.remote, `mkdir -p ${shellQuote(dir)}`, { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS }).then(() => {})
+    mkdir: (dir) => sshOk(target.remote, `mkdir -p ${shellQuote(dir)}`, opts).then(() => {})
   };
 }
 
@@ -665,12 +717,7 @@ function createRemoteWriteOps(target) {
 // no ssh push is needed.
 function createRemoteEditOps(target, localCwd) {
   const remotePath = path => {
-    // If absolute, treat as already-on-remote.
     if (_nodePath.isAbsolute(path)) return path;
-    // Otherwise resolve relative to the local cwd used for the edit workspace
-    // and then map to remote cwd via joinRemote. The pi-coding-agent's edit
-    // tool runs with localCwd, so any relative path it gives is relative to
-    // that. Mapping preserves intent.
     const relative = _nodePath.relative(localCwd, path).split(_nodePath.sep).join("/");
     if (relative.startsWith("../") || relative === "..") {
       throw new Error(`Resolved edit path ${path} escaped the local SSH edit workspace.`);
@@ -678,18 +725,20 @@ function createRemoteEditOps(target, localCwd) {
     if (!relative || relative === ".") return target.remoteCwd;
     return joinRemote(target.remoteCwd, relative);
   };
-
+  const sshOpts = {
+    timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS,
+    identityFile: target.identityFile,
+    user: target.user,
+    port: target.port
+  };
   return {
-    readFile: (absolutePath) => sshOk(target.remote, `cat ${shellQuote(remotePath(absolutePath))}`, { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS }),
+    readFile: (absolutePath) => sshOk(target.remote, `cat ${shellQuote(remotePath(absolutePath))}`, sshOpts),
     writeFile: async (absolutePath, content) => {
-      await sshOk(target.remote, `cat > ${shellQuote(remotePath(absolutePath))}`, {
-        timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS,
-        stdin: content
-      });
+      await sshOk(target.remote, `cat > ${shellQuote(remotePath(absolutePath))}`, { ...sshOpts, stdin: content });
     },
     access: (absolutePath) => {
       const p = remotePath(absolutePath);
-      return sshOk(target.remote, `test -r ${shellQuote(p)} && test -w ${shellQuote(p)}`, { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS }).then(() => {});
+      return sshOk(target.remote, `test -r ${shellQuote(p)} && test -w ${shellQuote(p)}`, sshOpts).then(() => {});
     }
   };
 }
@@ -700,11 +749,12 @@ function createRemoteBashOps(target) {
       const script = `cd ${shellQuote(cwd || target.remoteCwd)}\n${command}\n`;
       const { exitCode } = await sshExec(target.remote, "exec bash -se", {
         stdin: script,
-        // Default to 30 s if the caller didn't set one. Without this
-        // a long-running remote command could hang the agent forever.
         timeoutSeconds: typeof timeout === "number" && timeout > 0 ? timeout : DEFAULT_SSH_TIMEOUT_SECONDS,
         onStdoutData: onData,
-        onStderrData: onData
+        onStderrData: onData,
+        identityFile: target.identityFile,
+        user: target.user,
+        port: target.port
       });
       return { exitCode };
     }
@@ -740,21 +790,20 @@ function isCompressiblePath(p) {
 }
 
 async function scpTransfer(target, direction, source, destination, recursive) {
-  // -v must come BEFORE source paths; if it comes after, scp interprets
-  // it as another filename and fails with "No such file or directory".
-  // We always want -v for the transfer-summary parse.
   const flags = ["-v"];
   if (recursive) flags.push("-r");
-  if (isCompressiblePath(direction === "upload" ? source : source)) flags.push("-C");
+  if (isCompressiblePath(source)) flags.push("-C");
+  // Pass ssh options so scp's internal ssh uses BatchMode + publickey.
+  flags.push("-o", "BatchMode=yes", "-o", "PreferredAuthentications=publickey");
+  if (target.identityFile) flags.push("-o", `IdentityFile=${target.identityFile}`);
+  if (target.user) flags.push("-o", `User=${target.user}`);
+  if (target.port && target.port !== 22) flags.push("-P", String(target.port));
   let args;
   if (direction === "upload") {
-    // local -> remote. We symlink-check the destination up front; if the
-    // remote path is a symlink the upload would write through it and
-    // possibly corrupt the target.
     try {
       await sshOk(target.remote,
         `if [ -L ${shellQuote(destination)} ]; then exit 9; fi; exit 0`,
-        { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS });
+        { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS, identityFile: target.identityFile, user: target.user, port: target.port });
     } catch (e: any) {
       const msg = String(e?.message ?? e);
       if (msg.includes("exit (9)")) {
@@ -764,7 +813,6 @@ async function scpTransfer(target, direction, source, destination, recursive) {
     }
     args = [...flags, source, `${target.remote}:${destination}`];
   } else if (direction === "download") {
-    // remote -> local
     args = [...flags, `${target.remote}:${source}`, destination];
   } else {
     throw new Error(`ssh_scp: invalid direction '${direction}' (must be 'upload' or 'download')`);
@@ -871,11 +919,11 @@ async function execSshEdit(editBase, pi, target, localCwd, params) {
   // Pull current content.
   let beforeSha = "empty";
   let original = "";
+  const sshOpts = { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS, identityFile: target.identityFile, user: target.user, port: target.port };
   try {
-    original = (await sshOk(target.remote, `cat ${shellQuote(absoluteRemote)}`, { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS })).toString("utf8");
+    original = (await sshOk(target.remote, `cat ${shellQuote(absoluteRemote)}`, sshOpts)).toString("utf8");
     beforeSha = _nodeCrypto.createHash("sha256").update(original, "utf8").digest("hex");
   } catch (e) {
-    // Missing file -> start with blank content (sha256 of empty string).
     original = "";
     beforeSha = _nodeCrypto.createHash("sha256").update("", "utf8").digest("hex");
   }
@@ -912,13 +960,10 @@ async function execSshEdit(editBase, pi, target, localCwd, params) {
     };
   }
 
-  // Push via the same ssh transport. Symlink check identical to
-  // createRemoteWriteOps: refuse if the target became a symlink between
-  // the pull and the push (TOCTOU race window is small but real).
   try {
     await sshOk(target.remote,
       `if [ -L ${shellQuote(absoluteRemote)} ]; then exit 9; fi; exit 0`,
-      { timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS });
+      sshOpts);
   } catch (e) {
     const msg = String((e as any)?.message ?? e);
     if (msg.includes("exit (9)")) {
@@ -932,7 +977,10 @@ async function execSshEdit(editBase, pi, target, localCwd, params) {
   }
   await sshOk(target.remote, `cat > ${shellQuote(absoluteRemote)}`, {
     timeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS,
-    stdin: Buffer.from(afterContent, "utf8")
+    stdin: Buffer.from(afterContent, "utf8"),
+    identityFile: target.identityFile,
+    user: target.user,
+    port: target.port
   });
 
   // Return native edit result so renderer shows the diff against the
@@ -1025,11 +1073,31 @@ function sshToolsExtension(pi) {
       "ssh-missing": "ssh binary not found"
     };
 
-    // Probe BEFORE setting any state. If probe fails, the user/agent sees
-    // a clear categorized error and activeTarget stays null. Phases are
-    // surfaced via ctx.ui.notify so the user sees progress in the TUI.
-    ctx.ui.notify(`Probing ${profile.remote}...`, "info");
+    // Resolve identity/user/port from sshConfigAlias once. Passed to all
+    // sshExec/sshOk calls so the correct key is used from the start.
+    let resolvedIdentityFile, resolvedUser, resolvedPort;
+    if (profile.sshConfigAlias) {
+      try {
+        const r = _nodeChild_process.spawnSync("ssh", ["-G", profile.sshConfigAlias], { encoding: "utf8", timeout: 5000 });
+        if (r.status === 0) {
+          const lines = r.stdout.split("\n").reduce((acc, l) => {
+            const kv = l.trim().split(/\s+/);
+            if (kv.length >= 2) acc[kv[0].toLowerCase()] = kv.slice(1).join(" ");
+            return acc;
+          }, {} as Record<string, string>);
+          resolvedUser = lines.user;
+          resolvedPort = parseInt(lines.port, 10) || 22;
+          resolvedIdentityFile = lines.identityfile;
+          if (resolvedIdentityFile?.startsWith("~")) resolvedIdentityFile = _nodeOs.homedir() + resolvedIdentityFile.slice(1);
+        }
+      } catch {}
+    }
+
+    ctx.ui.notify(`[ssh-ts] probe START remote=${profile.remote} alias=${profile.sshConfigAlias || "-"}`, "info");
+    if (profile._sshTrace) ctx.ui.notify(profile._sshTrace, "info");
+    const probeStart = Date.now();
     const r = await probe(profile.remote, undefined, profile.sshConfigAlias);
+    ctx.ui.notify(`[ssh-ts] probe END ${Date.now() - probeStart}ms ok=${r.ok} user=${r.user || "-"} ip=${r.ip || "-"} reason=${r.reason || "-"}`, "info");
     if (!r.ok) {
       const ipSuffix = r.ip && r.ip !== profile.remote ? ` (${r.ip})` : "";
       const msg = `SSH mode NOT activated: ${reasonText[r.reason] || r.reason}${ipSuffix} — ${r.detail}`;
@@ -1038,26 +1106,45 @@ function sshToolsExtension(pi) {
     }
     ctx.ui.notify(`Auth OK as ${r.user} on ${r.ip || profile.remote}`, "info");
 
+    ctx.ui.notify(`[ssh-ts] cwd START ssh=${profile.remote} cmd=pwd`, "info");
+    const cwdStart = Date.now();
     const remoteCwd = await (async () => {
       if (profile.cwd && profile.cwd.trim()) return profile.cwd.trim();
       try {
-        return (await sshOk(profile.remote, "pwd")).toString("utf8").trim();
+        return (await sshOk(profile.remote, "pwd", {
+          timeoutSeconds: 6,
+          identityFile: resolvedIdentityFile,
+          user: resolvedUser,
+          port: resolvedPort
+        })).toString("utf8").trim();
       } catch { return ""; }
     })();
+    ctx.ui.notify(`[ssh-ts] cwd END ${Date.now() - cwdStart}ms cwd=${JSON.stringify(remoteCwd)}`, "info");
 
-    activeTarget = { name: profile.name, remote: profile.remote, remoteCwd };
+    activeTarget = {
+      name: profile.name,
+      remote: profile.remote,
+      remoteCwd,
+      identityFile: resolvedIdentityFile,
+      user: resolvedUser,
+      port: resolvedPort
+    };
     enableSshTools();
     updateStatus(ctx);
     ctx.ui.notify(`SSH mode on: ${activeTarget.name} (${activeTarget.remoteCwd})`, "info");
 
     // Print the verify block so the agent/user can sanity-check
     // identity, user, hostname, cwd before the first mutation.
+    ctx.ui.notify(`[ssh-ts] verifyBlock START remote=${activeTarget.remote} alias=${profile.sshConfigAlias || "-"}`, "info");
+    const verifyStart = Date.now();
     let verifyBlock = "";
     try {
       verifyBlock = await buildVerifyBlock(activeTarget, activeTarget.remoteCwd, undefined, profile.sshConfigAlias);
+      ctx.ui.notify(`[ssh-ts] verifyBlock END ${Date.now() - verifyStart}ms len=${verifyBlock.length}`, "info");
       ctx.ui.notify(verifyBlock, "info");
     } catch (e) {
       verifyBlock = `(verify-block failed: ${e.message})`;
+      ctx.ui.notify(`[ssh-ts] verifyBlock FAILED ${Date.now() - verifyStart}ms err=${e.message}`, "warning");
       ctx.ui.notify(verifyBlock, "warning");
     }
 
@@ -1104,14 +1191,18 @@ function sshToolsExtension(pi) {
     },
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const arg = (params && params.target || "").trim();
+      ctx.ui.notify(`[ssh-ts] enter arg=${JSON.stringify(arg)}`, "info");
       if (!arg) {
+        ctx.ui.notify(`[ssh-ts] missing target arg`, "warning");
         return {
           content: [{ type: "text", text: "ssh_target_select: missing 'target' argument" }],
           details: { ok: false, reason: "bad-args" }
         };
       }
 
+      ctx.ui.notify(`[ssh-ts] normalizing...`, "info");
       const profile = normalizeTargetArg(arg);
+      ctx.ui.notify(`[ssh-ts] normalized name=${profile.name} remote=${profile.remote} alias=${profile.sshConfigAlias || "-"} untrusted=${!!profile.untrusted}`, "info");
       if (!profile.remote) {
         return {
           content: [{ type: "text", text: `ssh_target_select: ${profile.error || "cannot resolve target"}` }],
@@ -1300,7 +1391,10 @@ function sshToolsExtension(pi) {
       // the full output — the throttler only feeds intermediate updates.
       const r = await sshExecVerbose(target.remote, fullCmd, {
         timeoutSeconds: params.timeout ?? 60,
-        onUpdate
+        onUpdate,
+        identityFile: target.identityFile,
+        user: target.user,
+        port: target.port
       });
       const elapsed = Date.now() - t0;
       // Audit log: append-only file with command + target + result. Lets
