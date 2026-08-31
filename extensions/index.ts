@@ -185,12 +185,18 @@ function normalizeTargetArg(arg) {
 
   const prof = profiles[resolved];
   let remote, cwd;
+  // sshConfigAlias from profiles.json: when set, probe() will resolve the
+  // alias via `ssh -G <alias>` instead of DNS. The resolved hostname from
+  // ssh -G becomes the `remote` for TCP-connect and ssh-whoami.
+  let sshConfigAlias;
   if (sshCfg) {
     remote = sshCfg.remote;
     cwd    = safeCwd(inlineCwd) || safeCwd(prof ? prof.cwd : undefined);
   } else if (prof) {
     remote = (prof.host && isSafeTargetString(prof.host)) ? prof.host : resolved;
     cwd    = safeCwd(inlineCwd) || safeCwd(prof.cwd);
+    // Carry sshConfigAlias through so probe() can use it instead of DNS.
+    sshConfigAlias = (prof.sshConfigAlias && isSafeTargetString(prof.sshConfigAlias)) ? prof.sshConfigAlias : undefined;
   } else {
     // No profile, no alias, no ssh-config Host block. Do NOT silently
     // pass this through to ssh(1) — the user probably mistyped or the
@@ -208,7 +214,7 @@ function normalizeTargetArg(arg) {
   // an unsafe cwd, drop it.
   if (cwd && !isSafeTargetString(cwd)) cwd = undefined;
 
-  return { name: resolved, remote, cwd, untrusted: false };
+  return { name: resolved, remote, cwd, untrusted: false, sshConfigAlias };
 }
 
 // Human-readable list of available targets for error messages.
@@ -395,25 +401,68 @@ async function sshOk(remote, command, options = {}) {
 
 // Categorize an ssh failure into agent-friendly reasons.
 // Returns { ok: true, user, ip } or { ok: false, reason, detail, ip }.
-async function probe(remote, seconds = DEFAULT_PROBE_SECONDS) {
-  // DNS lookup with its own short timeout so a slow DNS resolver does
-  // not eat the whole probe budget. Fall back to the raw hostname if
-  // the lookup hangs.
-  const dnsTimeout = new Promise<string>(resolve => {
-    setTimeout(() => resolve(remote), Math.min(seconds * 1000, 1500));
-  });
-  const dnsLookup = (async () => {
-    try {
-      return (await _nodeDns.promises.lookup(remote)).address;
-    } catch {
-      return remote;
-    }
-  })();
-  const ip = await Promise.race([dnsLookup, dnsTimeout]);
+//
+// When sshConfigAlias is set (profiles.json sshConfigAlias field), the
+// alias is resolved via `ssh -G <alias>` instead of a DNS lookup. This
+// bypasses DNS for ~/.ssh/config Host aliases that have no DNS record.
+async function probe(remote, seconds = DEFAULT_PROBE_SECONDS, sshConfigAlias?: string) {
+  let ip: string;
+  let resolvedUser: string | undefined;
+  let resolvedPort: number;
+  let resolvedIdentityFile: string | undefined;
 
-  // Step 1: TCP connect on :22.
+  if (sshConfigAlias) {
+    // Resolve via ssh -G: hostname, user, port, identityfile from ~/.ssh/config.
+    // Do NOT use DNS — the alias may not exist in DNS.
+    // Use spawnSync for cross-node-version compatibility (Node 26 changed
+    // promises.exec to return streams instead of strings for stdout/stderr).
+    let parsed: { hostname: string; port: number; user?: string; identityFile?: string } | null = null;
+    try {
+      const r = _nodeChild_process.spawnSync(
+        "ssh", ["-G", sshConfigAlias],
+        { encoding: "utf8", timeout: 5000 }
+      );
+      if (r.status === 0) {
+        const lines = r.stdout.split("\n").reduce((acc, l) => {
+          const kv = l.trim().split(/\s+/);
+          if (kv.length >= 2) acc[kv[0].toLowerCase()] = kv.slice(1).join(" ");
+          return acc;
+        }, {} as Record<string, string>);
+        const hostname = lines.hostname || sshConfigAlias;
+        const port = parseInt(lines.port, 10) || 22;
+        const user = lines.user || undefined;
+        let identityFile = lines.identityfile;
+        if (identityFile?.startsWith("~")) identityFile = _nodeOs.homedir() + identityFile.slice(1);
+        parsed = { hostname, port, user, identityFile };
+      }
+    } catch { /* keep parsed = null */ }
+    if (!parsed) {
+      return { ok: false, reason: "unreachable", detail: `ssh -G ${sshConfigAlias} failed`, ip: "" };
+    }
+    ip = parsed.hostname;
+    resolvedUser = parsed.user;
+    resolvedPort = parsed.port;
+    resolvedIdentityFile = parsed.identityFile;
+  } else {
+    // DNS lookup with its own short timeout so a slow DNS resolver does
+    // not eat the whole probe budget. Fall back to the raw hostname if
+    // the lookup hangs.
+    const dnsTimeout = new Promise<string>(resolve => {
+      setTimeout(() => resolve(remote), Math.min(seconds * 1000, 1500));
+    });
+    const dnsLookup = (async () => {
+      try {
+        return (await _nodeDns.promises.lookup(remote)).address;
+      } catch {
+        return remote;
+      }
+    })();
+    ip = await Promise.race([dnsLookup, dnsTimeout]);
+  }
+
+  // Step 1: TCP connect on resolved port (default 22).
   const portOk = await new Promise(resolve => {
-    const sock = _nodeNet.createConnection({ host: ip, port: 22, family: 4 });
+    const sock = _nodeNet.createConnection({ host: ip, port: resolvedPort ?? 22, family: 4 });
     let done = false;
     const finish = v => { if (!done) { done = true; resolve(v); } };
     sock.setTimeout(seconds * 1000);
@@ -422,20 +471,25 @@ async function probe(remote, seconds = DEFAULT_PROBE_SECONDS) {
     sock.once("error", e => finish(e.code || "error"));
   });
   if (portOk !== true) {
+    const port = resolvedPort ?? 22;
     const reason = portOk === "timeout" || /timeout/i.test(String(portOk))
       ? "unreachable" : "unreachable";
     const detail = portOk === "timeout"
-      ? `no TCP response on ${ip}:22 within ${seconds}s`
-      : `TCP connect to ${ip}:22 failed: ${portOk}`;
+      ? `no TCP response on ${ip}:${port} within ${seconds}s`
+      : `TCP connect to ${ip}:${port} failed: ${portOk}`;
     return { ok: false, reason, detail, ip };
   }
 
-  // Step 2: ssh whoami to confirm banner + auth.
-  const args = [
+  // Step 2: ssh whoami with resolved identityfile, user, and port.
+  // Use the resolved IP as the SSH target — NOT the sshConfigAlias name.
+  const args: string[] = [
     "-o", `ConnectTimeout=${seconds}`,
     "-o", "BatchMode=yes",
     "-o", "PreferredAuthentications=publickey",
-    remote, "whoami"
+    ...(resolvedIdentityFile ? ["-i", resolvedIdentityFile] : []),
+    ...(resolvedUser       ? ["-l", resolvedUser]         : []),
+    ...(resolvedPort && resolvedPort !== 22 ? ["-p", String(resolvedPort)] : []),
+    ip, "whoami"
   ];
   return new Promise(resolve => {
     const proc = _nodeChild_process.spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
@@ -504,10 +558,13 @@ function fingerprintFor(keyPath) {
 
 // ---- verify block -----------------------------------------------------
 
-async function buildVerifyBlock(target, cwd, seconds = 6) {
+async function buildVerifyBlock(target, cwd, seconds = 6, sshConfigAlias?: string) {
   const remote = target.remote;
   const profileName = target.name;
-  const idFile = identityFileFor(remote);
+  // Use sshConfigAlias for identity-file lookup so ssh -G resolves the
+  // correct key. Without it, identityFileFor(remote=IP) falls back to id_rsa
+  // because the IP has no matching ~/.ssh/config Host block.
+  const idFile = identityFileFor(sshConfigAlias || remote);
   const fp     = fingerprintFor(idFile);
   const t = seconds;
   const SEP = "@@ssh-cli-verify@@";
@@ -972,7 +1029,7 @@ function sshToolsExtension(pi) {
     // a clear categorized error and activeTarget stays null. Phases are
     // surfaced via ctx.ui.notify so the user sees progress in the TUI.
     ctx.ui.notify(`Probing ${profile.remote}...`, "info");
-    const r = await probe(profile.remote);
+    const r = await probe(profile.remote, undefined, profile.sshConfigAlias);
     if (!r.ok) {
       const ipSuffix = r.ip && r.ip !== profile.remote ? ` (${r.ip})` : "";
       const msg = `SSH mode NOT activated: ${reasonText[r.reason] || r.reason}${ipSuffix} — ${r.detail}`;
@@ -997,7 +1054,7 @@ function sshToolsExtension(pi) {
     // identity, user, hostname, cwd before the first mutation.
     let verifyBlock = "";
     try {
-      verifyBlock = await buildVerifyBlock(activeTarget, activeTarget.remoteCwd);
+      verifyBlock = await buildVerifyBlock(activeTarget, activeTarget.remoteCwd, undefined, profile.sshConfigAlias);
       ctx.ui.notify(verifyBlock, "info");
     } catch (e) {
       verifyBlock = `(verify-block failed: ${e.message})`;
