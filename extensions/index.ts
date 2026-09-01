@@ -78,14 +78,41 @@ function parseSshConfigProfiles() {
   }
   const text = _nodeFs.readFileSync(SSH_CONFIG_PATH, "utf8");
   const profiles = new Map();
+  let currentHost = null;
   for (const rawLine of text.split("\n")) {
     const line = rawLine.replace(/\s+#.*$/, "").trim();
     if (!line) continue;
-    const match = line.match(/^Host\s+(.+)$/i);
-    if (!match) continue;
-    for (const alias of match[1].split(/\s+/).map(s => s.trim()).filter(Boolean)) {
-      if (alias.includes("*") || alias.includes("?") || alias.startsWith("!")) continue;
-      if (!profiles.has(alias)) profiles.set(alias, { name: alias, remote: alias });
+    const hostMatch = line.match(/^Host\s+(.+)$/i);
+    if (hostMatch) {
+      // Pick the first non-pattern alias as the concrete key.
+      const aliases = hostMatch[1].split(/\s+/).map(s => s.trim()).filter(Boolean);
+      const concrete = aliases.find(a => !a.includes("*") && !a.includes("?") && !a.startsWith("!"));
+      if (concrete) {
+        profiles.set(concrete, { name: concrete, remote: concrete });
+        currentHost = concrete;
+      } else {
+        currentHost = null;
+      }
+      continue;
+    }
+    if (!currentHost) continue;
+    const block = profiles.get(currentHost);
+    const kv = line.match(/^(\S+)\s+(.+)$/);
+    if (!kv) continue;
+    const [, key, value] = kv;
+    const lk = key.toLowerCase();
+    if (lk === "hostname") {
+      block.remote = value;
+    } else if (lk === "user") {
+      block.user = value;
+    } else if (lk === "port") {
+      block.port = parseInt(value, 10);
+    } else if (lk === "identityfile") {
+      // Strip surrounding quotes (single or double) before tilde expansion.
+      const cleaned = value.replace(/^["']|["']$/g, "");
+      block.identityFile = cleaned.startsWith("~")
+        ? _nodeOs.homedir() + cleaned.slice(1)
+        : cleaned;
     }
   }
   const arr = Array.from(profiles.values()).sort((a, b) => a.name.localeCompare(b.name));
@@ -446,7 +473,7 @@ async function sshOk(remote, command, options = {}) {
 // When sshConfigAlias is set (profiles.json sshConfigAlias field), the
 // alias is resolved via `ssh -G <alias>` instead of a DNS lookup. This
 // bypasses DNS for ~/.ssh/config Host aliases that have no DNS record.
-async function probe(remote, seconds = DEFAULT_PROBE_SECONDS, sshConfigAlias?: string) {
+async function probe(remote, seconds = DEFAULT_PROBE_SECONDS, sshConfigAlias?: string, overrides?: { user?: string; identityFile?: string; port?: number }) {
   let ip: string;
   let resolvedUser: string | undefined;
   let resolvedPort: number;
@@ -457,6 +484,10 @@ async function probe(remote, seconds = DEFAULT_PROBE_SECONDS, sshConfigAlias?: s
     // Do NOT use DNS — the alias may not exist in DNS.
     // Use spawnSync for cross-node-version compatibility (Node 26 changed
     // promises.exec to return streams instead of strings for stdout/stderr).
+    // Resolution order (highest priority first):
+    //   1) overrides (profile.* from profiles.json, passed by activate)
+    //   2) ssh -G <alias>
+    //   3) parseSshConfigProfiles() direct ~/.ssh/config read
     let parsed: { hostname: string; port: number; user?: string; identityFile?: string } | null = null;
     try {
       const r = _nodeChild_process.spawnSync(
@@ -477,13 +508,40 @@ async function probe(remote, seconds = DEFAULT_PROBE_SECONDS, sshConfigAlias?: s
         parsed = { hostname, port, user, identityFile };
       }
     } catch { /* keep parsed = null */ }
-    if (!parsed) {
-      return { ok: false, reason: "unreachable", detail: `ssh -G ${sshConfigAlias} failed`, ip: "" };
+    // Fallback to direct ~/.ssh/config parse when ssh -G fails OR returns
+    // no user (some WSL / older ssh builds omit the user line even when
+    // ~/.ssh/config has `User root`). Without this fallback the auth
+    // call falls through to local OS user and fails.
+    if (parsed && (!parsed.user || !parsed.identityFile)) {
+      const direct = parseSshConfigProfiles().find(p => p.name === sshConfigAlias);
+      if (direct) {
+        parsed = {
+          ...parsed,
+          user: parsed.user || direct.user,
+          identityFile: parsed.identityFile || direct.identityFile,
+          port: parsed.port || direct.port || 22,
+          hostname: parsed.hostname || direct.remote || sshConfigAlias,
+        };
+      }
     }
+    if (!parsed) {
+      const direct = parseSshConfigProfiles().find(p => p.name === sshConfigAlias);
+      if (direct) {
+        parsed = {
+          hostname: direct.remote || sshConfigAlias,
+          port: direct.port || 22,
+          user: direct.user,
+          identityFile: direct.identityFile,
+        };
+      } else {
+        return { ok: false, reason: "unreachable", detail: `ssh -G ${sshConfigAlias} failed and no ~/.ssh/config match`, ip: "" };
+      }
+    }
+    // Apply overrides last so they win over ssh -G AND ~/.ssh/config parses.
     ip = parsed.hostname;
-    resolvedUser = parsed.user;
-    resolvedPort = parsed.port;
-    resolvedIdentityFile = parsed.identityFile;
+    resolvedUser          = overrides?.user          ?? parsed.user;
+    resolvedPort          = overrides?.port          ?? parsed.port;
+    resolvedIdentityFile  = overrides?.identityFile  ?? parsed.identityFile;
   } else {
     // DNS lookup with its own short timeout so a slow DNS resolver does
     // not eat the whole probe budget. Fall back to the raw hostname if
@@ -1119,10 +1177,23 @@ function sshToolsExtension(pi) {
       "ssh-missing": "ssh binary not found"
     };
 
-    // Resolve identity/user/port from sshConfigAlias once. Passed to all
-    // sshExec/sshOk calls so the correct key is used from the start.
+    // Resolution order (highest priority first):
+    //   1) profile.* (profiles.json)        — authoritative user config
+    //   2) ssh -G <sshConfigAlias>          — fills missing fields
+    //   3) parseSshConfigProfiles() (direct) — final fallback for gaps
+
+    // 1) profile.* — wins if set. Tilde-expand identityFile.
     let resolvedIdentityFile, resolvedUser, resolvedPort;
-    if (profile.sshConfigAlias) {
+    if (profile.user) resolvedUser = profile.user;
+    if (profile.identityFile) {
+      resolvedIdentityFile = profile.identityFile.startsWith("~")
+        ? _nodeOs.homedir() + profile.identityFile.slice(1)
+        : profile.identityFile;
+    }
+    if (profile.port) resolvedPort = profile.port;
+
+    // 2) ssh -G — fills gaps when profile.* didn't set the field.
+    if (profile.sshConfigAlias && (!resolvedUser || !resolvedIdentityFile || !resolvedPort)) {
       try {
         const r = _nodeChild_process.spawnSync("ssh", ["-G", profile.sshConfigAlias], { encoding: "utf8", timeout: 5000 });
         if (r.status === 0) {
@@ -1131,18 +1202,34 @@ function sshToolsExtension(pi) {
             if (kv.length >= 2) acc[kv[0].toLowerCase()] = kv.slice(1).join(" ");
             return acc;
           }, {} as Record<string, string>);
-          resolvedUser = lines.user;
-          resolvedPort = parseInt(lines.port, 10) || 22;
-          resolvedIdentityFile = lines.identityfile;
-          if (resolvedIdentityFile?.startsWith("~")) resolvedIdentityFile = _nodeOs.homedir() + resolvedIdentityFile.slice(1);
+          if (!resolvedUser)          resolvedUser          = lines.user;
+          if (!resolvedPort)          resolvedPort          = parseInt(lines.port, 10) || 22;
+          if (!resolvedIdentityFile) {
+            resolvedIdentityFile = lines.identityfile;
+            if (resolvedIdentityFile?.startsWith("~")) resolvedIdentityFile = _nodeOs.homedir() + resolvedIdentityFile.slice(1);
+          }
         }
       } catch {}
+    }
+
+    // 3) parseSshConfigProfiles() — final fallback for any remaining gaps.
+    if (profile.sshConfigAlias && (!resolvedUser || !resolvedIdentityFile || !resolvedPort)) {
+      const parsed = parseSshConfigProfiles().find(p => p.name === profile.sshConfigAlias);
+      if (parsed) {
+        if (!resolvedUser)          resolvedUser          = parsed.user;
+        if (!resolvedIdentityFile) resolvedIdentityFile  = parsed.identityFile;
+        if (!resolvedPort)         resolvedPort          = parsed.port;
+      }
     }
 
     ctx.ui.notify(`[ssh-ts] probe START remote=${profile.remote} alias=${profile.sshConfigAlias || "-"}`, "info");
     if (profile._sshTrace) ctx.ui.notify(profile._sshTrace, "info");
     const probeStart = Date.now();
-    const r = await probe(profile.remote, undefined, profile.sshConfigAlias);
+    const r = await probe(profile.remote, undefined, profile.sshConfigAlias, {
+      user: resolvedUser,
+      identityFile: resolvedIdentityFile,
+      port: resolvedPort,
+    });
     ctx.ui.notify(`[ssh-ts] probe END ${Date.now() - probeStart}ms ok=${r.ok} user=${r.user || "-"} ip=${r.ip || "-"} reason=${r.reason || "-"}`, "info");
     if (!r.ok) {
       const ipSuffix = r.ip && r.ip !== profile.remote ? ` (${r.ip})` : "";
