@@ -23,6 +23,7 @@ const SSH_CONFIG_PATH = _nodePath.join(_nodeOs.homedir(), ".ssh", "config");
 const PROFILES_FILE = _nodePath.join(_nodeOs.homedir(), ".config", "agent-ssh-tools", "profiles.json");
 const DEFAULT_PROBE_SECONDS = 6;
 const DEFAULT_SSH_TIMEOUT_SECONDS = 30;
+const DEFAULT_SCP_TIMEOUT_SECONDS = 600;
 
 // ---- shell quoting -----------------------------------------------------
 
@@ -789,7 +790,8 @@ function isCompressiblePath(p) {
   return COMPRESSIBLE_EXT.has(p.slice(idx).toLowerCase());
 }
 
-async function scpTransfer(target, direction, source, destination, recursive) {
+async function scpTransfer(target, direction, source, destination, recursive, timeoutSeconds) {
+  const killTimeoutMs = (typeof timeoutSeconds === "number" && timeoutSeconds > 0 ? timeoutSeconds : DEFAULT_SCP_TIMEOUT_SECONDS) * 1000;
   const flags = ["-v"];
   if (recursive) flags.push("-r");
   if (isCompressiblePath(source)) flags.push("-C");
@@ -832,7 +834,7 @@ async function scpTransfer(target, direction, source, destination, recursive) {
     const killTimer = setTimeout(() => {
       killed = true;
       try { child.kill("SIGKILL"); } catch {}
-    }, DEFAULT_SSH_TIMEOUT_SECONDS * 1000);
+    }, killTimeoutMs);
     child.stdout.on("data", d => outChunks.push(d));
     child.stderr.on("data", d => {
       errChunks.push(d);
@@ -1504,6 +1506,10 @@ function sshToolsExtension(pi) {
           type: "boolean",
           description: "Set true to transfer directories (scp -r)",
           default: false
+        },
+        timeoutSeconds: {
+          type: "number",
+          description: "Override scp kill timeout in seconds (default 600). Set higher for very large files."
         }
       },
       required: ["source", "destination"]
@@ -1588,7 +1594,7 @@ function sshToolsExtension(pi) {
       let r;
       try {
         r = await scpTransfer(
-          target, params.direction, params.source, params.destination, !!params.recursive
+          target, params.direction, params.source, params.destination, !!params.recursive, params.timeoutSeconds
         );
       } catch (e: any) {
         return {
