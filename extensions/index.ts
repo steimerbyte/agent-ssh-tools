@@ -855,7 +855,7 @@ async function scpTransfer(target, direction, source, destination, recursive) {
       clearTimeout(killTimer);
       resolve({
         exitCode: 127, stdout: Buffer.alloc(0), stderr: Buffer.from(String(err?.message ?? err)),
-        elapsedMs: Date.now() - t0, sourceSha256: "", destinationSha256: "", truncated: false
+        elapsedMs: Date.now() - t0, sourceSha256: "", destinationSha256: "", truncated: false, args
       });
     });
     child.on("close", async code => {
@@ -863,7 +863,7 @@ async function scpTransfer(target, direction, source, destination, recursive) {
       if (killed) {
         resolve({
           exitCode: 124, stdout: Buffer.concat(outChunks), stderr: Buffer.concat(errChunks),
-          elapsedMs: Date.now() - t0, sourceSha256: "", destinationSha256: "", truncated: false
+          elapsedMs: Date.now() - t0, sourceSha256: "", destinationSha256: "", truncated: false, args
         });
         return;
       }
@@ -881,7 +881,7 @@ async function scpTransfer(target, direction, source, destination, recursive) {
         exitCode: code ?? 0, stdout, stderr,
         elapsedMs: Date.now() - t0,
         sourceSha256: srcSha, destinationSha256: dstSha, truncated,
-        sentBytes, receivedBytes, elapsedSec, sentBps, receivedBps
+        sentBytes, receivedBytes, elapsedSec, sentBps, receivedBps, args
       });
     });
   });
@@ -1622,7 +1622,7 @@ function sshToolsExtension(pi) {
       const parts = [];
       // Surface the actual scp command in the result so debugging is
       // trivial: copy-paste the scp line and it works.
-      parts.push(`$ scp ${args.join(" ")}`);
+      parts.push(`$ scp ${r.args.join(" ")}`);
       if (r.exitCode !== 0) {
         parts.push(`[scp ${direction} failed exit=${r.exitCode}]`);
         // scp emits diagnostics on stderr ('debug1: ...', 'scp: No such
