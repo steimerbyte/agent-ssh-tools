@@ -24,6 +24,7 @@ const PROFILES_FILE = _nodePath.join(_nodeOs.homedir(), ".config", "agent-ssh-to
 const DEFAULT_PROBE_SECONDS = 6;
 const DEFAULT_SSH_TIMEOUT_SECONDS = 30;
 const DEFAULT_SCP_TIMEOUT_SECONDS = 600;
+const DEFAULT_EXPECTED_SCP_THROUGHPUT_BPS = 12_500_000; // 12 MB/s — reasonable WAN estimate
 
 // ---- shell quoting -----------------------------------------------------
 
@@ -1567,6 +1568,7 @@ function sshToolsExtension(pi) {
       // For upload: confirm source exists locally before invoking scp
       // (scp's error message 'No such file or directory' without the
       // filename is ambiguous and hard to debug).
+      let fileSizeBytes: number | null = null;
       if (direction === "upload") {
         try {
           const st = _nodeFs.statSync(params.source);
@@ -1581,6 +1583,18 @@ function sshToolsExtension(pi) {
           if (st.isDirectory() && !params.recursive) {
             ctx.ui.notify(`ssh_scp: source is a directory — auto-setting recursive=true`, "info");
             params = { ...params, recursive: true };
+          }
+          // Pre-flight ETA: only for regular files (dirs have unknown total size).
+          if (st.isFile()) {
+            fileSizeBytes = st.size;
+            const etaSeconds = Math.ceil(fileSizeBytes / DEFAULT_EXPECTED_SCP_THROUGHPUT_BPS);
+            const mbS = DEFAULT_EXPECTED_SCP_THROUGHPUT_BPS / 1024 / 1024;
+            onUpdate({
+              content: [{
+                type: "text",
+                text: `uploading ${(fileSizeBytes / 1024 / 1024).toFixed(1)} MB — ETA ~${etaSeconds}s at assumed ${mbS.toFixed(0)} MB/s`
+              }]
+            });
           }
         } catch (e: any) {
           return {
@@ -1658,6 +1672,15 @@ function sshToolsExtension(pi) {
         if (r.sourceSha256 && r.destinationSha256) {
           parts.push(`sha256  src=${r.sourceSha256.slice(0,12)}  dst=${r.destinationSha256.slice(0,12)}  ${sha256Match ? "MATCH" : "MISMATCH"}`);
         }
+        if (r.elapsedSec !== null && r.elapsedSec > 0 && r.sentBytes !== null && r.sentBytes > 0) {
+          const avgBps = r.sentBytes / r.elapsedSec;
+          const avgMbS = avgBps / 1024 / 1024;
+          parts.push(`avg    ${avgMbS.toFixed(2)} MB/s  (${r.sentBytes} bytes in ${r.elapsedSec.toFixed(1)} s)`);
+          if (typeof fileSizeBytes === "number" && fileSizeBytes > 0) {
+            const projectedS = fileSizeBytes / avgBps;
+            parts.push(`eta    ~${projectedS.toFixed(0)}s for full ${(fileSizeBytes/1024/1024).toFixed(1)} MB at observed rate`);
+          }
+        }
         if (r.truncated) parts.push(`[output truncated — exceeds 10MB cap]`);
       }
       return {
@@ -1674,6 +1697,8 @@ function sshToolsExtension(pi) {
           sent_bps: r.sentBps,
           received_bps: r.receivedBps,
           transfer_time_seconds: r.elapsedSec,
+          file_size_bytes: fileSizeBytes,
+          avg_speed_bps: r.elapsedSec > 0 && r.sentBytes > 0 ? Math.round(r.sentBytes / r.elapsedSec) : null,
           sha256_match: sha256Match,
           sha256_source: r.sourceSha256,
           sha256_destination: r.destinationSha256
