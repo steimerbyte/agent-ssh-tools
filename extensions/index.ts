@@ -25,6 +25,7 @@ const DEFAULT_PROBE_SECONDS = 6;
 const DEFAULT_SSH_TIMEOUT_SECONDS = 30;
 const DEFAULT_SCP_TIMEOUT_SECONDS = 600;
 const DEFAULT_EXPECTED_SCP_THROUGHPUT_BPS = 12_500_000; // 12 MB/s — reasonable WAN estimate
+const DEFAULT_SCP_BUFFER_SECONDS = 60;
 
 // ---- shell quoting -----------------------------------------------------
 
@@ -791,7 +792,7 @@ function isCompressiblePath(p) {
   return COMPRESSIBLE_EXT.has(p.slice(idx).toLowerCase());
 }
 
-async function scpTransfer(target, direction, source, destination, recursive, timeoutSeconds) {
+async function scpTransfer(target, direction, source, destination, recursive, timeoutSeconds, onUpdate, fileSizeBytes) {
   const killTimeoutMs = (typeof timeoutSeconds === "number" && timeoutSeconds > 0 ? timeoutSeconds : DEFAULT_SCP_TIMEOUT_SECONDS) * 1000;
   const flags = ["-v"];
   if (recursive) flags.push("-r");
@@ -823,6 +824,45 @@ async function scpTransfer(target, direction, source, destination, recursive, ti
   return new Promise((resolve) => {
     const t0 = Date.now();
     const child = _nodeChild_process.spawn("scp", args, { stdio: ["pipe", "pipe", "pipe"] });
+    const liveStartMs = Date.now();
+    const liveEnabled = process.platform === "linux" && typeof onUpdate === "function" && typeof fileSizeBytes === "number" && fileSizeBytes > 0;
+    let liveTimer: any = null;
+    let lastSampleBytes = 0;
+    let lastSampleMs = liveStartMs;
+    let rollingBps = 0; // EWMA throughput for stability
+    if (liveEnabled) {
+      liveTimer = setInterval(() => {
+        let bytesSoFar = 0;
+        try {
+          const io = _nodeFs.readFileSync(`/proc/${child.pid}/io`, "utf8");
+          const key = direction === "upload" ? "rchar" : "wchar";
+          const m = io.match(new RegExp(`${key}:\\s*(\\d+)`));
+          if (m) bytesSoFar = parseInt(m[1], 10);
+        } catch { /* /proc not available or process gone */ }
+        const nowMs = Date.now();
+        const intervalMs = nowMs - lastSampleMs;
+        const intervalBytes = Math.max(0, bytesSoFar - lastSampleBytes);
+        const instBps = intervalMs > 0 ? (intervalBytes / intervalMs) * 1000 : 0;
+        rollingBps = rollingBps > 0 ? (rollingBps * 0.7 + instBps * 0.3) : instBps;
+        const elapsedS = (nowMs - liveStartMs) / 1000;
+        const bytesPerSec = rollingBps > 0 ? rollingBps : DEFAULT_EXPECTED_SCP_THROUGHPUT_BPS;
+        const remainingBytes = Math.max(0, fileSizeBytes - bytesSoFar);
+        const etaS = Math.ceil(remainingBytes / bytesPerSec);
+        const mbSoFar = (bytesSoFar / 1024 / 1024).toFixed(1);
+        const mbTotal = (fileSizeBytes / 1024 / 1024).toFixed(1);
+        const mbS = (bytesPerSec / 1024 / 1024).toFixed(2);
+        try {
+          onUpdate({
+            content: [{
+              type: "text",
+              text: `transferring ${mbSoFar}/${mbTotal} MB  ${elapsedS.toFixed(0)}s elapsed  ${mbS} MB/s  ETA ~${etaS}s remaining`
+            }]
+          });
+        } catch { /* onUpdate errors must not break the tool */ }
+        lastSampleBytes = bytesSoFar;
+        lastSampleMs = nowMs;
+      }, 1000);
+    }
     const outChunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
     // Capture progress lines (stderr from -v) so we can summarise.
@@ -855,6 +895,7 @@ async function scpTransfer(target, direction, source, destination, recursive, ti
     });
     child.stdin.end();
     child.on("error", err => {
+      if (liveTimer) clearInterval(liveTimer);
       clearTimeout(killTimer);
       resolve({
         exitCode: 127, stdout: Buffer.alloc(0), stderr: Buffer.from(String(err?.message ?? err)),
@@ -864,6 +905,7 @@ async function scpTransfer(target, direction, source, destination, recursive, ti
     child.on("close", async code => {
       clearTimeout(killTimer);
       if (killed) {
+        if (liveTimer) clearInterval(liveTimer);
         resolve({
           exitCode: 124, stdout: Buffer.concat(outChunks), stderr: Buffer.concat(errChunks),
           elapsedMs: Date.now() - t0, sourceSha256: "", destinationSha256: "", truncated: false, args
@@ -880,6 +922,7 @@ async function scpTransfer(target, direction, source, destination, recursive, ti
       // caller can verify integrity. Async fs operations.
       const srcSha = await sha256FileAsync(direction === "upload" ? source : destination);
       const dstSha = await sha256FileAsync(direction === "upload" ? destination : source);
+      if (liveTimer) clearInterval(liveTimer);
       resolve({
         exitCode: code ?? 0, stdout, stderr,
         elapsedMs: Date.now() - t0,
@@ -1605,10 +1648,15 @@ function sshToolsExtension(pi) {
         }
       }
       const t0 = Date.now();
+      let timeoutSeconds = params.timeoutSeconds;
+      if ((typeof timeoutSeconds !== "number" || timeoutSeconds <= 0) && typeof fileSizeBytes === "number" && fileSizeBytes > 0) {
+        timeoutSeconds = Math.ceil(fileSizeBytes / DEFAULT_EXPECTED_SCP_THROUGHPUT_BPS) + DEFAULT_SCP_BUFFER_SECONDS;
+      }
       let r;
       try {
         r = await scpTransfer(
-          target, params.direction, params.source, params.destination, !!params.recursive, params.timeoutSeconds
+          target, params.direction, params.source, params.destination, !!params.recursive,
+          timeoutSeconds, onUpdate, fileSizeBytes
         );
       } catch (e: any) {
         return {
