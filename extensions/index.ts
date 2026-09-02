@@ -1,11 +1,10 @@
-// agent-ssh-tools — Pi coding-agent extension
+// @ts-nocheck — legacy JS-style source; runtime correctness only.
 // SSH profile manager + read/write/edit/exec tools with agent-safety
 // hardening. Inspired by the original pi-ssh-tools plugin; adds probe-
 // before-activate, verify-block, profile+alias resolver, timeouts, and
 // SHA-256 unchanged-detection. See README for the full feature list.
-
 import * as _nodeChild_process from "node:child_process";
-import * as _nodeDns from "node:dns";
+
 import * as _nodeFs from "node:fs";
 import * as _nodeNet from "node:net";
 import * as _nodeOs from "node:os";
@@ -26,6 +25,17 @@ const DEFAULT_SSH_TIMEOUT_SECONDS = 30;
 const DEFAULT_SCP_TIMEOUT_SECONDS = 600;
 const DEFAULT_EXPECTED_SCP_THROUGHPUT_BPS = 12_500_000; // 12 MB/s — reasonable WAN estimate
 const DEFAULT_SCP_BUFFER_SECONDS = 60;
+
+// omp's renderCallback signature is (args, options, theme); upstream pi is
+// (args, theme, context). Sniff the 2nd arg: if it has a .fg() method it's
+// the theme, otherwise it's the options object and the theme is the 3rd.
+function _isTheme(x) {
+  return !!x && typeof x.fg === "function" && typeof x.bold === "function";
+}
+function _pickTheme(a, b, c) {
+  return _isTheme(a) ? a : (_isTheme(b) ? b : c);
+}
+
 
 // ---- shell quoting -----------------------------------------------------
 
@@ -1305,8 +1315,7 @@ function sshToolsExtension(pi) {
   pi.registerTool({
     name: "ssh_target_select",
     label: "ssh_target_select",
-    description: "Select an SSH target. Probes the host (TCP + ssh BatchMode whoami) and prints a verify block (user, hostname, cwd, key, date). On failure no state changes; on success the other ssh_* tools become usable.",
-    promptSnippet: "Switch the active SSH target with probe + verify",
+    description: "Select an SSH target. Probes the host (TCP + ssh BatchMode whoami) and prints a verify block (user, hostname, cwd, key, date). On failure no state changes; on success the other ssh_* tools become usable. Tip: switch the active SSH target with probe + verify.",
     promptGuidelines: [
       "Call this whenever you need to operate on a remote host. Read the verify block it returns and confirm hostname / user / key / cwd match the user's intent before running ssh_read / ssh_write / ssh_edit / ssh_bash.",
       "If the tool returns an error (unreachable / refused / auth / timeout), do NOT retry without changing something — the verify result is the truth about the current network/auth state.",
@@ -1369,7 +1378,8 @@ function sshToolsExtension(pi) {
         details: { ok: true, target: r.target }
       };
     },
-    renderCall(args, theme) {
+    renderCall(args, second, third) {
+      const theme = _pickTheme(second, third, second);
       const t = typeof args?.target === "string" ? args.target : "...";
       return new _piTui.Text(
         `${theme.fg("toolTitle", theme.bold("ssh_target_select"))} ${theme.fg("accent", t)}`,
@@ -1383,7 +1393,6 @@ function sshToolsExtension(pi) {
     name: "ssh_read",
     label: "ssh_read",
     description: "Read a file on the active SSH host. Relative paths are resolved against the active remote working directory.",
-    promptSnippet: "Read file contents on the active SSH host",
     promptGuidelines: ["Use ssh_read when the task is on the active SSH host instead of the local machine."],
     parameters: readBase.parameters,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -1392,13 +1401,19 @@ function sshToolsExtension(pi) {
         ? params.path
         : joinRemote(target.remoteCwd, params.path);
       const t0 = Date.now();
-      const tool = _piCodingAgent.createReadToolDefinition(target.remoteCwd, { operations: createRemoteReadOps(target) });
-      const transformed = { ...params, path: abs };
-      const result = await tool.execute(toolCallId, transformed, signal, onUpdate, ctx);
+      // omp: createReadToolDefinition silently ignores { operations }, so
+      // the read would silently go to the local filesystem. Do the SSH
+      // cat directly via the same remote-ops helper instead.
+      const ops = createRemoteReadOps(target);
+      const raw = await ops.readFile(abs);
       ctx.ui.notify(`$ ssh ${target.remote} read ${abs}  ${Date.now() - t0}ms`, "info");
-      return result;
+      return {
+        content: [{ type: "text", text: raw.toString("utf8") }],
+        details: { host: target.remote, path: abs }
+      };
     },
-    renderCall(args, theme) {
+    renderCall(args, second, third) {
+      const theme = _pickTheme(second, third, second);
       const path = typeof args?.path === "string" ? args.path : "...";
       const targetLabel = activeTarget ? activeTarget.name : "inactive";
       return new _piTui.Text(
@@ -1413,7 +1428,6 @@ function sshToolsExtension(pi) {
     name: "ssh_write",
     label: "ssh_write",
     description: "Write a text file on the active SSH host. Relative paths are resolved against the active remote working directory.",
-    promptSnippet: "Create or overwrite files on the active SSH host",
     promptGuidelines: ["Use ssh_write only for new files or full rewrites on the active SSH host."],
     parameters: writeBase.parameters,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -1427,13 +1441,18 @@ function sshToolsExtension(pi) {
       if (size > 64 * 1024) {
         ctx.ui.notify(`writing ${(size / 1024).toFixed(1)} KB to ${target.remote}:${abs}...`, "info");
       }
-      const tool = _piCodingAgent.createWriteToolDefinition(target.remoteCwd, { operations: createRemoteWriteOps(target) });
-      const transformed = { ...params, path: abs };
-      const result = await tool.execute(toolCallId, transformed, signal, onUpdate, ctx);
+      // omp: createWriteToolDefinition({ operations }) THROWS — no pluggable
+      // seam. Do the SSH write directly via the same remote-ops helper.
+      const ops = createRemoteWriteOps(target);
+      await ops.writeFile(abs, content);
       ctx.ui.notify(`$ ssh ${target.remote} write ${abs}  ${Date.now() - t0}ms`, "info");
-      return result;
+      return {
+        content: [{ type: "text", text: `${size} bytes written to ${abs}` }],
+        details: { host: target.remote, path: abs, bytes: size }
+      };
     },
-    renderCall(args, theme) {
+    renderCall(args, second, third) {
+      const theme = _pickTheme(second, third, second);
       const path = typeof args?.path === "string" ? args.path : "...";
       const targetLabel = activeTarget ? activeTarget.name : "inactive";
       return new _piTui.Text(
@@ -1448,14 +1467,12 @@ function sshToolsExtension(pi) {
     name: "ssh_edit",
     label: "ssh_edit",
     description: "Edit a file on the active SSH host using exact text replacement. Relative paths are resolved against the active remote working directory. The file is skipped if the post-edit content matches the pre-pull content (SHA-256).",
-    promptSnippet: "Make precise file edits on the active SSH host",
     promptGuidelines: [
       "Use ssh_edit for precise remote changes.",
       "Each edits[].oldText must match exactly on the remote file.",
       "The push is skipped automatically when the edit produced no change."
     ],
     parameters: editBase.parameters,
-    prepareArguments: editBase.prepareArguments,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const target = requireActiveTarget();
       const t0 = Date.now();
@@ -1469,7 +1486,8 @@ function sshToolsExtension(pi) {
       }
       return result;
     },
-    renderCall(args, theme) {
+    renderCall(args, second, third) {
+      const theme = _pickTheme(second, third, second);
       const path = typeof args?.path === "string" ? args.path : "...";
       const targetLabel = activeTarget ? activeTarget.name : "inactive";
       return new _piTui.Text(
@@ -1508,7 +1526,6 @@ function sshToolsExtension(pi) {
     name: "ssh_bash",
     label: "ssh_bash",
     description: "Execute a bash command on the active SSH host in the active remote working directory.",
-    promptSnippet: "Execute bash commands on the active SSH host",
     promptGuidelines: ["Use ssh_bash when the command must run on the active SSH host rather than locally."],
     parameters: bashBase.parameters,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -1571,14 +1588,15 @@ function sshToolsExtension(pi) {
         }
       };
     },
-    renderCall(args, theme, context) {
+    renderCall(args, second, third) {
+      const theme = _pickTheme(second, third, second);
       const command = typeof args?.command === "string" ? args.command : "...";
       const targetLabel = activeTarget ? activeTarget.name : "inactive";
-      const text = context.lastComponent ?? new _piTui.Text("", 0, 0);
-      text.setText(
-        `${theme.fg("toolTitle", theme.bold("ssh_bash"))} ${theme.fg("accent", command)} ${theme.fg("muted", `[${targetLabel}]`)}`
+      // omp: no renderContext/lastComponent. Always allocate a new Text.
+      return new _piTui.Text(
+        `${theme.fg("toolTitle", theme.bold("ssh_bash"))} ${theme.fg("accent", command)} ${theme.fg("muted", `[${targetLabel}]`)}`,
+        0, 0
       );
-      return text;
     },
     renderResult(result, _options, theme) {
       const details = (result?.details ?? {}) as { cwd?: string; host?: string; exit?: number; elapsedMs?: number };
@@ -1604,7 +1622,6 @@ function sshToolsExtension(pi) {
     name: "ssh_scp",
     label: "ssh_scp",
     description: "Transfer files between the local machine and the active SSH host via scp. Use direction='upload' to send local->remote, or 'download' for remote->local. Set recursive=true for directories. The target param is optional — defaults to the currently-active ssh target.",
-    promptSnippet: "Transfer files between local and active remote host",
     promptGuidelines: [
       "Use ssh_scp when the user wants to move a file/directory between this machine and the active SSH host.",
       "Prefer ssh_scp over ssh_bash 'cat < local | ssh remote cat >' pipelines — scp handles binary data, permissions, partial failures.",
@@ -1840,7 +1857,8 @@ function sshToolsExtension(pi) {
         }
       };
     },
-    renderCall(args, theme) {
+    renderCall(args, second, third) {
+      const theme = _pickTheme(second, third, second);
       const dir = typeof args?.direction === "string" ? args.direction : "?";
       const src = typeof args?.source === "string" ? args.source : "...";
       const dst = typeof args?.destination === "string" ? args.destination : "...";
