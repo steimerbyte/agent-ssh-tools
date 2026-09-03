@@ -1,7 +1,8 @@
 # agent-ssh-tools
 
-> **Agent-Safety SSH Extension for Pi** — verified activation, read/write/edit/exec
-> tools, and guard-rails that prevent AI agents from mutating the wrong host.
+> **Agent-Safety SSH Extension for Pi / omp** — verified activation,
+> read/write/edit/exec/scp tools, and guard-rails that prevent AI agents
+> from mutating the wrong host.
 
 ## Install
 
@@ -11,7 +12,7 @@ pi install npm:@steimerbyte/agent-ssh-tools
 
 ## Tools and commands
 
-The plugin registers five tools and one slash command:
+The plugin registers six tools and one slash command:
 
 | Tool / Command | Purpose |
 |----------------|---------|
@@ -20,6 +21,7 @@ The plugin registers five tools and one slash command:
 | `ssh_write` | Write a file on the active remote |
 | `ssh_edit` | Edit a file with exact text replacement (SHA-256 unchanged-detection) |
 | `ssh_bash` | Run a shell command on the active remote |
+| `ssh_scp` | Transfer files between local and the active remote (upload/download) |
 | `/sshactivate <name[:/path]>` | User-initiated activation with probe + verify |
 | `/sshactivate off` | Deactivate |
 | `/sshactivate status` | Show current target |
@@ -40,9 +42,7 @@ agent calls ssh_target_select web01   (probe + verify + set)
      │            agent can try a different host
      │
      └── ok ───► activeTarget set, verify block printed
-                 │
-                 ▼
-       agent calls ssh_read / ssh_write / ssh_edit / ssh_bash
+                agent calls ssh_read / ssh_write / ssh_edit / ssh_bash / ssh_scp
                  │
                  ▼
        agent calls ssh_target_select web02 to switch mid-task
@@ -198,10 +198,12 @@ remote cwd**, not the local process cwd. Matches the intuition: "I said
 
 ## Config
 
-| File | Purpose |
-|------|---------|
+| File / Variable | Purpose |
+|-----------------|---------|
 | `~/.config/agent-ssh-tools/profiles.json` | profiles + aliases |
 | `~/.ssh/config` | auto-discovered hosts (read-only) |
+| `SSH_CLI_AUTO_ACTIVATE=1` (env) | Auto-enable SSH tools at session start so the agent can use them without typing `/sshactivate`. The target still has to be picked via `ssh_target_select` (probe + verify run as usual). `/sshactivate off` overrides. |
+| `--ssh-activate` (CLI flag) | Same effect as the env var; passed to `pi`/`omp` at startup. |
 
 ## Credits
 
