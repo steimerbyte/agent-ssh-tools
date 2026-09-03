@@ -615,70 +615,79 @@ function knownHostsFileArg() {
 // consumes it (envHash). The function already exists in this file (see
 // Slice C); we do not redeclare it here.
 
-// withProfileLock — module-internal mutex on a per-profile directory.
-// mkdir is atomic on POSIX (mkdir(2) with O_EXCL semantics): if the lock
-// directory already exists, mkdirSync throws EEXIST and we know another
-// holder is active. We retry every 50ms up to a 5s deadline; on timeout
-// we throw with a clear reason so the calling tool surfaces it to the
-// agent instead of hanging silently. Cleanup: rmdir the lock dir on the
-// happy path; if the holder process crashes between mkdir and rmdir the
-// lock self-heals on the next process restart (the holder is dead, the
-// directory is stale, mkdir on the next call succeeds).
+// Concurrent access policy — do NOT block. Multiple agents/operations on
+// the same profile run in parallel: ssh/scp multiplex their own sockets
+// and the audit log is append-only, so no consistency is lost. If another
+// agent is already active on this profile, log a warning into the audit
+// log + the renderResult so the operator sees it but the operation
+// proceeds. Cleanup on process exit is best-effort: stale hints are
+// harmless because the warning just says "another agent was last seen at
+// <ts>" and the operator can ignore ancient ones.
 //
-// Lock-path: sandboxPaths().lockDir/<profileName>.lock — one lock per
-// profile so two ssh_bash calls on different profiles run in parallel.
-// profileName is sanitized to basename+alnum to keep a malicious caller
-// from injecting path separators into the lock path.
-const LOCK_RETRY_INTERVAL_MS = 50;
-const LOCK_TIMEOUT_MS = 5000;
-// Replace anything outside [A-Za-z0-9._-] with '_'. Defensive: profileName
-// should be a known-safe alias from profiles.json / ssh-config, but a
-// hostile target.name must never reach the filesystem.
+// Hint path: sandboxPaths().lockDir/<profileName>.active — one hint file
+// per profile. profileName is sanitized the same way the old lock path
+// was, so the threat model (path-separator injection via hostile
+// target.name) is unchanged.
 const SAFE_PROFILE_LOCK_RE = /[^A-Za-z0-9._-]/g;
-async function withProfileLock(profileName, fn) {
+async function noteConcurrentUse(profileName) {
   const lockDir = sandboxPaths().lockDir;
-  // Ensure lockDir exists with mode 0700. mkdirSync recursive is
-  // idempotent; mode is best-effort (umask may mask on some platforms)
-  // so we chmod afterwards.
-  try {
-    _nodeFs.mkdirSync(lockDir, { recursive: true, mode: 0o700 });
-    try { _nodeFs.chmodSync(lockDir, 0o700); } catch { /* best-effort */ }
-  } catch (err) {
-    throw new Error(`withProfileLock: cannot create lock dir '${lockDir}': ${err && err.message || err}`);
-  }
+  try { _nodeFs.mkdirSync(lockDir, { recursive: true, mode: 0o700 }); } catch {}
   const safeName = String(profileName || "").replace(SAFE_PROFILE_LOCK_RE, "_") || "default";
-  const lockPath = _nodePath.join(lockDir, `${safeName}.lock`);
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
-  // Spinning retry: try to claim the lock by mkdir. If EEXIST we wait.
-  while (true) {
-    try {
-      // mkdirSync without recursive throws EEXIST when the directory is
-      // already there — exactly the atomic-claim semantics we want.
-      _nodeFs.mkdirSync(lockPath, { mode: 0o700 });
-      break; // got it
-    } catch (err) {
-      if (err && err.code !== "EEXIST") {
-        throw new Error(`withProfileLock: unexpected error claiming '${lockPath}': ${err.message || err}`);
-      }
-      if (Date.now() >= deadline) {
-        throw new Error(
-          `withProfileLock: timeout after ${LOCK_TIMEOUT_MS}ms acquiring lock for profile '${profileName}' at '${lockPath}'`
-        );
-      }
-      const { promise: waitPromise, resolve: waitResolve } = Promise.withResolvers<void>();
-      setTimeout(waitResolve, LOCK_RETRY_INTERVAL_MS);
-      await waitPromise;
-    }
-  }
+  const hintPath = _nodePath.join(lockDir, `${safeName}.active`);
+  const now = new Date().toISOString();
+  // If a hint file already exists, another agent is currently active.
+  // Read it for the warning message; do NOT block, do NOT delete.
+  let prev = { active: false };
   try {
-    return await fn();
-  } finally {
-    // Best-effort cleanup. If rmdir fails (e.g. someone else rmrf'd the
-    // sandbox), the next call will still see the directory and skip —
-    // not a correctness problem, just stale-state cosmetics.
-    try { _nodeFs.rmdirSync(lockPath); } catch { /* best-effort */ }
-  }
+    const raw = _nodeFs.readFileSync(hintPath, "utf8");
+    prev = JSON.parse(raw);
+    prev.active = true;
+  } catch { /* no prior holder */ }
+  // Write our own hint with the same name (overwriting is fine — we are
+  // declaring "we are active now", not claiming exclusive access).
+  try {
+    _nodeFs.writeFileSync(hintPath, JSON.stringify({
+      pid: process.pid,
+      cmdline: process.argv.slice(0, 2).join(" "),
+      since: now,
+    }), { mode: 0o600 });
+  } catch { /* best-effort */ }
+  return prev;
 }
+
+// Best-effort hint cleanup when our tool body finishes. The hint is
+// advisory only — stale hints are harmless because the warning just says
+// "another agent was last seen at <ts>" and the operator can ignore
+// ancient ones.
+function clearConcurrentUse(profileName) {
+  try {
+    const lockDir = sandboxPaths().lockDir;
+    const safeName = String(profileName || "").replace(SAFE_PROFILE_LOCK_RE, "_") || "default";
+    const hintPath = _nodePath.join(lockDir, `${safeName}.active`);
+    const raw = _nodeFs.readFileSync(hintPath, "utf8");
+    const data = JSON.parse(raw);
+    if (data.pid === process.pid) {
+      _nodeFs.unlinkSync(hintPath);
+    }
+  } catch { /* not ours, or already gone */ }
+}
+
+// Clear ALL hints for our pid on shutdown (best-effort). Mirrors the old
+// lock-cleanup behavior for symetry: a hint from a still-running omp
+// instance is never deleted here (different pid).
+process.on("exit", () => {
+  try {
+    const lockDir = sandboxPaths().lockDir;
+    if (!_nodeFs.existsSync(lockDir)) return;
+    for (const f of _nodeFs.readdirSync(lockDir)) {
+      if (!f.endsWith(".active")) continue;
+      try {
+        const data = JSON.parse(_nodeFs.readFileSync(_nodePath.join(lockDir, f), "utf8"));
+        if (data.pid === process.pid) _nodeFs.unlinkSync(_nodePath.join(lockDir, f));
+      } catch { /* skip */ }
+    }
+  } catch { /* ignore */ }
+});
 
 // _auditMeta — produces the two new TSV fields every audit row needs:
 //   envHash    = sha256(keys(sandboxEnv()).sort().join('|')).slice(0,12)
@@ -2293,11 +2302,19 @@ function sshToolsExtension(pi) {
       const cwd = target.remoteCwd;
       const cmd = params.command;
       const fullCmd = cwd ? `cd ${shellQuote(cwd)} && ${cmd}` : cmd;
-      // Concurrent ops on the same profile serialize via withProfileLock:
-      // mkdir-spinning pattern (mkdir + EEXIST, 50ms retry, 5s deadline).
-      // The lock is held across sshExecVerbose + audit write so the audit
-      // row and the op result stay consistent under concurrent calls.
-      return withProfileLock(target.name, async () => {
+      // Record that we're active on this profile before we start; if
+      // another agent was already active, capture the warning text so
+      // we can surface it both in the audit log and the result. The
+      // operation proceeds regardless — ssh multiplexes sockets and the
+      // audit log is append-only, so two parallel ops stay consistent.
+      const concurrent = await noteConcurrentUse(target.name);
+      const concurrentWarn = concurrent.active
+        ? `[!] concurrent use: another agent (pid=${concurrent.pid}) was last active on '${target.name}' at ${concurrent.since}\n\n`
+        : "";
+      const concurrentTag = concurrent.active
+        ? `WARN concurrent target=${target.name} other_pid=${concurrent.pid} since=${concurrent.since}`
+        : "";
+      try {
         const t0 = Date.now();
         // Forward onUpdate so the tool result streams live. sshExec routes
         // it through a 150ms-throttler with a 64KB visible-buffer cap so
@@ -2315,12 +2332,18 @@ function sshToolsExtension(pi) {
         // Audit log: append-only file with command + target + result. Lets
         // the user audit destructive remote commands after the fact. Path:
         // sandboxPaths().auditLog (atomic append via O_APPEND, mode 0600).
+        // When concurrent use was detected, prefix a WARN line with the
+        // same timestamp so it groups with the actual op row.
         try {
           const { envHash, sandboxRoot } = _auditMeta();
           const stdoutHash = _nodeCrypto.createHash("sha256").update(r.stdout).digest("hex").slice(0, 12);
           const stderrHash = _nodeCrypto.createHash("sha256").update(r.stderr).digest("hex").slice(0, 12);
+          const ts = new Date().toISOString();
+          if (concurrentTag) {
+            _writeAuditLog([ts, envHash, sandboxRoot, concurrentTag]);
+          }
           _writeAuditLog([
-            new Date().toISOString(),
+            ts,
             envHash,
             sandboxRoot,
             target.name,
@@ -2338,7 +2361,10 @@ function sshToolsExtension(pi) {
           ctx?.ui?.notify?.(`audit log write failed: ${errMsg}`, "warning");
         }
         // Output only — the renderResult composes the verbose header.
+        // The concurrent-use warning (if any) is prepended so the
+        // operator sees it at the top of the rendered output.
         const parts: string[] = [];
+        if (concurrentWarn) parts.push(concurrentWarn.trimEnd());
         if (r.stdout.length) parts.push(r.stdout.toString("utf8").trimEnd());
         if (r.stderr.length && r.exit !== 0) parts.push(`[stderr]\n${r.stderr.toString("utf8").trimEnd()}`);
         if (r.truncated) parts.push(`[output truncated — exceeds 10MB cap]`);
@@ -2353,7 +2379,9 @@ function sshToolsExtension(pi) {
             truncated: r.truncated
           }
         };
-      });
+      } finally {
+        clearConcurrentUse(target.name);
+      }
     },
     renderCall(args, second, third) {
       const theme = _pickTheme(second, third, second);
@@ -2514,11 +2542,20 @@ function sshToolsExtension(pi) {
           };
         }
       }
-      // Concurrent ops on the same profile serialize via withProfileLock:
-      // mkdir-spinning pattern (mkdir + EEXIST, 50ms retry, 5s deadline).
-      // The lock is held across scpTransfer + audit write so the audit
-      // row and the transfer stay consistent under concurrent calls.
-      return withProfileLock(target.name, async () => {
+      // Record that we're active on this profile before we start; if
+      // another agent was already active, capture the warning text so
+      // we can surface it both in the audit log and the result. The
+      // operation proceeds regardless — scp multiplexes its own
+      // channels via ssh and the audit log is append-only, so two
+      // parallel ops stay consistent.
+      const concurrent = await noteConcurrentUse(target.name);
+      const concurrentWarn = concurrent.active
+        ? `[!] concurrent use: another agent (pid=${concurrent.pid}) was last active on '${target.name}' at ${concurrent.since}\n`
+        : "";
+      const concurrentTag = concurrent.active
+        ? `WARN concurrent target=${target.name} other_pid=${concurrent.pid} since=${concurrent.since}`
+        : "";
+      try {
         const t0 = Date.now();
         let timeoutSeconds = params.timeoutSeconds;
         if ((typeof timeoutSeconds !== "number" || timeoutSeconds <= 0) && typeof fileSizeBytes === "number" && fileSizeBytes > 0) {
@@ -2541,10 +2578,16 @@ function sshToolsExtension(pi) {
         // Audit log: append-only file with transfer + result. Lets the user
         // audit destructive remote transfers after the fact. Path:
         // sandboxPaths().auditLog (atomic append via O_APPEND, mode 0600).
+        // When concurrent use was detected, prefix a WARN line with the
+        // same timestamp so it groups with the actual transfer row.
         try {
           const { envHash, sandboxRoot } = _auditMeta();
+          const ts = new Date().toISOString();
+          if (concurrentTag) {
+            _writeAuditLog([ts, envHash, sandboxRoot, concurrentTag]);
+          }
           _writeAuditLog([
-            new Date().toISOString(),
+            ts,
             envHash,
             sandboxRoot,
             "scp",
@@ -2562,6 +2605,9 @@ function sshToolsExtension(pi) {
           ]);
         } catch { /* audit failures must not break tool */ }
         const parts = [];
+        // The concurrent-use warning (if any) is prepended so the
+        // operator sees it at the top of the rendered output.
+        if (concurrentWarn) parts.push(concurrentWarn.trimEnd());
         // Surface the actual scp command in the result so debugging is
         // trivial: copy-paste the scp line and it works.
         parts.push(`$ scp ${r.args.join(" ")}`);
@@ -2607,7 +2653,9 @@ function sshToolsExtension(pi) {
             direction: params.direction
           }
         };
-      });
+      } finally {
+        clearConcurrentUse(target.name);
+      }
     },
     renderCall(args, second, third) {
       const theme = _pickTheme(second, third, second);
