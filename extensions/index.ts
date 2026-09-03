@@ -1873,9 +1873,9 @@ function sshToolsExtension(pi) {
   //   SSH_CLI_AUTO_ACTIVATE=1 pi -p "ssh_target_select pve-docker"
   //
   // When set, the SSH tools are auto-enabled at session_start so the
-  // agent can use them without the user typing /sshactivate first.
+  // agent can use them without the user typing /ssh-on first.
   // Target selection still requires ssh_target_select (probe + verify
-  // runs as usual). /sshactivate off explicitly overrides.
+  // runs as usual). /ssh-on off explicitly overrides.
 
   const autoActivateFromCli = (() => {
     try {
@@ -1929,7 +1929,7 @@ function sshToolsExtension(pi) {
   };
 
   // Activate (or fail) a target. Returns a structured result so both the
-  // /sshactivate command and the ssh_target_select tool can reuse this.
+  // /ssh-on command and the ssh_target_select tool can reuse this.
   const activate = async (profile, ctx) => {
     const reasonText = {
       unreachable: "host unreachable",
@@ -2626,18 +2626,20 @@ function sshToolsExtension(pi) {
     },
   });
 
-  // ---- /sshactivate command -------------------------------------------
+  // ---- /ssh-on command -----------------------------------------------
 
   // The slash command is the user's grant of permission for the agent to
   // perform remote operations. It does NOT select a target — that is the
   // agent's job via `ssh_target_select` (which probes + verifies before
   // committing). With no argument the command only enables the ssh_*
   // tools; with a target argument it is a convenience shortcut that
-  // enables tools AND sets the target (equivalent to /sshactivate +
+  // enables tools AND sets the target (equivalent to /ssh-on +
   // ssh_target_select).
+  // (Previously named `/sshactivate`. Renamed because omp's builtin
+  // `/ssh` slash-command shadowed the old name in the slash menu.)
 
-  pi.registerCommand("sshactivate", {
-    description: "Enable SSH tools (no target preselected): /sshactivate, /sshactivate <host>[:/path], /sshactivate off, /sshactivate status",
+  pi.registerCommand("ssh-on", {
+    description: "Enable SSH tools (no target preselected): /ssh-on, /ssh-on <host>[:/path], /ssh-on off, /ssh-on status",
     getArgumentCompletions: prefix => {
       const { merged } = refreshProfiles();
       const options = ["off", "status", ...merged.map(p => p.name)];
@@ -2662,7 +2664,7 @@ function sshToolsExtension(pi) {
           );
         } else {
           ctx.ui.notify(
-            "SSH: off — run /sshactivate to enable tools, /sshactivate <host> for one-shot",
+            "SSH: off — run /ssh-on to enable tools, /ssh-on <host> for one-shot",
             "info"
           );
         }
@@ -2676,24 +2678,24 @@ function sshToolsExtension(pi) {
         }
         const prev = activeTarget.name;
         deactivate(ctx);
-        ctx.ui.notify(`SSH mode off (was: ${prev}). Reload picks it up again or use /sshactivate.`, "info");
+        ctx.ui.notify(`SSH mode off (was: ${prev}). Reload picks it up again or use /ssh-on.`, "info");
         return;
       }
 
-      // Convenience form: /sshactivate <host> enables tools AND sets the
+      // Convenience form: /ssh-on <host> enables tools AND sets the
       // target in one step (probe + verify runs as part of activate).
-      // Equivalent to bare /sshactivate followed by ssh_target_select.
+      // Equivalent to bare /ssh-on followed by ssh_target_select.
       if (input) {
         const profile = normalizeTargetArg(input);
         if (profile.untrusted) {
-          ctx.ui.notify(`sshactivate: ${profile.error}\nAvailable: ${sshCliAvailableTargets()}`, "warning");
+          ctx.ui.notify(`ssh-on: ${profile.error}\nAvailable: ${sshCliAvailableTargets()}`, "warning");
           return;
         }
         await activate(profile, ctx);
         return;
       }
 
-      // Default form: /sshactivate with no argument enables the ssh_*
+      // Default form: /ssh-on with no argument enables the ssh_*
       // tools so the agent can call ssh_target_select to pick the host.
       // No probe runs — the agent chooses the target.
       enableSshTools();
@@ -2709,7 +2711,7 @@ function sshToolsExtension(pi) {
     if (autoActivateFromCli) {
       // CLI auto-activation: keep tools enabled across sessions. Status
       // marks this so the user can see why the tools are on without
-      // having typed /sshactivate.
+      // having typed /ssh-on.
       enableSshTools();
       ctx.ui.setStatus(
         SSH_STATUS_KEY,

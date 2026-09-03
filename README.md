@@ -22,14 +22,14 @@ The plugin registers six tools and one slash command:
 | `ssh_edit` | Edit a file with exact text replacement (SHA-256 unchanged-detection) |
 | `ssh_bash` | Run a shell command on the active remote |
 | `ssh_scp` | Transfer files between local and the active remote (upload/download) |
-| `/sshactivate <name[:/path]>` | User-initiated activation with probe + verify |
-| `/sshactivate off` | Deactivate |
-| `/sshactivate status` | Show current target |
+| `/ssh-on <name[:/path]>` | User-initiated activation with probe + verify |
+| `/ssh-on off` | Deactivate |
+| `/ssh-on status` | Show current target |
 
 ## Workflow
 
 ```
-user types /sshactivate                (grant permission — no host chosen)
+user types /ssh-on                      (grant permission — no host chosen)
      │
      ▼
 plugin enables ssh_* tools
@@ -52,14 +52,14 @@ The slash command and the agent-callable tool use **the same `activate()`**
 helper internally, so behavior is identical: same probe, same verify
 block, same error categorization.
 
-`/sshactivate <host>` is a convenience shortcut that combines the bare
-`/sshactivate` + `ssh_target_select <host>` in one step. Use it when the
-user already knows the host; use bare `/sshactivate` when the agent
+`/ssh-on <host>` is a convenience shortcut that combines the bare
+`/ssh-on` + `ssh_target_select <host>` in one step. Use it when the
+user already knows the host; use bare `/ssh-on` when the agent
 should pick.
 
 ### Why the split?
 
-`/sshactivate` is the user's **permission** to allow remote operations.
+`/ssh-on` is the user's **permission** to allow remote operations.
 `ssh_target_select` is the agent's **choice** of which host to operate
 on, with probe + verify to catch mistakes. Combining the two would mean
 the user has to commit to a host at the moment of permission; separating
@@ -79,7 +79,7 @@ to confirm it is on the right system before any mutation lands.
 ### 1. Probe-before-activate
 
 `ssh_target_select <host>` (and the convenience shortcut
-`/sshactivate <host>`) run two checks before changing any state:
+`/ssh-on <host>`) run two checks before changing any state:
 
 1. **TCP-connect** to port 22 with a 6-second timeout.
 2. **`ssh BatchMode whoami`** to confirm the SSH banner exchange and
@@ -150,7 +150,7 @@ Define reusable targets and short names in
 ```
 
 Hosts from `~/.ssh/config` are auto-discovered (wildcards `*` / `?` and
-negations `!` skipped) and appear in `/sshactivate` completion unless a
+negations `!` skipped) and appear in `/ssh-on` completion unless a
 profile with the same name is defined.
 
 Resolution order:
@@ -161,14 +161,14 @@ Resolution order:
 
    An optional `user@` prefix may be added to any of the above
    inputs (e.g. `ssh_target_select pcadmin@web01`,
-   `/sshactivate root@pve-docker`). The user part must be a plain
+   `/ssh-on root@pve-docker`). The user part must be a plain
    username (`[A-Za-z0-9._-]+`); it is stripped before resolution
    and wins over the user from `~/.ssh/config` / `profiles.json`.
    IPv6 literals (which carry `:`) are left untouched so
    `[user@::1]:22` is never mis-parsed.
 
 ### 4. Inline cwd via `name:/path` syntax
-`/sshactivate web01:/etc/nginx` (convenience form) or
+`/ssh-on web01:/etc/nginx` (convenience form) or
 `ssh_target_select web01:/etc/nginx` (agent-callable tool) override any
 stored cwd for this session. The inline path always wins.
 Aliases can also embed an inline path: `stage: web01-staging:/opt/app`
@@ -209,7 +209,7 @@ remote cwd**, not the local process cwd. Matches the intuition: "I said
 |-----------------|---------|
 | `~/.config/agent-ssh-tools/profiles.json` | profiles + aliases |
 | `~/.ssh/config` | auto-discovered hosts (read-only) |
-| `SSH_CLI_AUTO_ACTIVATE=1` (env) | Auto-enable SSH tools at session start so the agent can use them without typing `/sshactivate`. The target still has to be picked via `ssh_target_select` (probe + verify run as usual). `/sshactivate off` overrides. |
+| `SSH_CLI_AUTO_ACTIVATE=1` (env) | Auto-enable SSH tools at session start so the agent can use them without typing `/ssh-on`. The target still has to be picked via `ssh_target_select` (probe + verify run as usual). `/ssh-on off` overrides. |
 | `--ssh-activate` (CLI flag) | Same effect as the env var; passed to `pi`/`omp` at startup. |
 
 ## Sandbox layout
@@ -305,7 +305,7 @@ sollen, ist das ein eigenes Spec.
 | `AGENT_SSH_IMPORT_FROM_HOME` | `false` | Einmaliger Import-Trigger. Wenn `1`, kopiert die Extension beim ersten Bootstrap `~/.ssh/config`, `~/.ssh/known_hosts` und referenzierte IdentityFiles nach `$AGENT_SSH_ROOT/ssh/`. Original bleibt unangetastet. Siehe [Migration from ~/.ssh/](#migration-from-ssh). |
 | `AGENT_SSH_STRICT_HOSTKEY` | `yes` | Wert für `StrictHostKeyChecking`: `yes` = unknown host → fail closed; `accept-new` = erstes Mal akzeptieren und loggen; `no` = nicht empfohlen. |
 | `AGENT_SSH_FALLBACK_KEYS` | leer | Komma-separierte Liste absoluter Pfade zu privaten Keys, die beim Bootstrap zusätzlich versucht werden, wenn das aufgelöste IdentityFile nicht lädt. Beispiel: `AGENT_SSH_FALLBACK_KEYS=/home/me/.ssh/id_ed25519,/home/me/.ssh/work_key`. |
-| `SSH_CLI_AUTO_ACTIVATE=1` | unset | Auto-enable SSH tools beim Session-Start, ohne dass der User `/sshactivate` tippt. Target muss weiterhin via `ssh_target_select` gewählt werden (Probe + Verify laufen wie üblich). `/sshactivate off` überschreibt. |
+| `SSH_CLI_AUTO_ACTIVATE=1` | unset | Auto-enable SSH tools beim Session-Start, ohne dass der User `/ssh-on` tippt. Target muss weiterhin via `ssh_target_select` gewählt werden (Probe + Verify laufen wie üblich). `/ssh-on off` überschreibt. |
 | `--ssh-activate` (CLI-Flag) | — | Gleicher Effekt wie `SSH_CLI_AUTO_ACTIVATE=1`; an `pi`/`omp` beim Start übergeben. |
 
 ### Was die alten SSH-Agent-Env-Vars machen
@@ -368,7 +368,7 @@ verändert oder gelöscht.
    ```sh
    omp
    # im Prompt:
-   /sshactivate web01
+   /ssh-on web01
    # oder agent-getrieben:
    #   ssh_target_select web01
    ```
