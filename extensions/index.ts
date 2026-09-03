@@ -14,19 +14,173 @@ import * as _nodeCrypto from "node:crypto";
 import * as _piCodingAgent from "@earendil-works/pi-coding-agent";
 import * as _piTui from "@earendil-works/pi-tui";
 
+// ---- sandbox root + path resolver + migration helper --------------------
+
+// All persistent SSH data lives under $AGENT_SSH_ROOT (default
+// ~/.local/share/agent-ssh-tools/) instead of the user's ~/.ssh and
+// ~/.config/agent-ssh-tools/. This is the foundation for the SSH-stack
+// isolation refactor — every other slice (B agent-bootstrap, C allowlist
+// env + strict-hostkey, D concurrent-locks + audit, E README) builds on
+// the path surface defined here.
+
+// sandboxPaths() — pure path computation. No side effects, no mkdir.
+// Returns the same object on every call; safe to call repeatedly. Other
+// slices may import / reference individual fields (sandboxPaths().sshDir
+// etc.). The fallback identity list lives here too so all sandbox-shaped
+// path data has exactly one source of truth.
+function sandboxPaths() {
+  const root = process.env.AGENT_SSH_ROOT
+    || _nodePath.join(_nodeOs.homedir(), ".local", "share", "agent-ssh-tools");
+  return {
+    root,
+    sshDir:        _nodePath.join(root, "ssh"),
+    sshAgentDir:   _nodePath.join(root, "ssh", "agent"),
+    sshIdentityDir:_nodePath.join(root, "ssh", "identity"),
+    config:        _nodePath.join(root, "ssh", "config"),
+    // Alias kept for sibling slices that pre-dated this canonical version
+    // (slice B's `ssh -G` resolver reads sandboxPaths().sshConfig). Both
+    // names resolve to the same path so callers can pick whichever reads
+    // cleaner in context.
+    sshConfig:     _nodePath.join(root, "ssh", "config"),
+    knownHosts:    _nodePath.join(root, "ssh", "known_hosts"),
+    profilesFile:  _nodePath.join(root, "state", "profiles.json"),
+    bootstrapLog:  _nodePath.join(root, "state", "agent-bootstrap.log"),
+    auditLog:      _nodePath.join(root, "state", "audit.log"),
+    stateDir:      _nodePath.join(root, "state"),
+    tmpDir:        _nodePath.join(root, "tmp"),
+    lockDir:       _nodePath.join(root, "lock"),
+    // Hardcoded fallback identity list — same names as before the refactor.
+    // Lives in sandboxPaths() so a future slice can swap in env-driven
+    // defaults (AGENT_SSH_FALLBACK_KEYS) without touching callers.
+    fallbackIdentityFiles: ["~/.ssh/id_ed25519", "~/.ssh/id_rsa", "~/.ssh/HPE_Pvt_key"],
+  };
+}
+
+// ensureSandbox — mkdir recursive for the entire sandbox tree, mode 0700
+// on every directory. Idempotent: re-running on an already-existing
+// sandbox is a no-op. Uses fs.mkdirSync with { recursive: true } which
+// is itself idempotent and tolerates concurrent races (Node guarantees
+// no throw when the directory already exists). Never throws to callers;
+// returns { ok, error? } so the bootstrap path can log failures via
+// bootstrapDebug() without breaking the SSH path.
+async function ensureSandbox() {
+  try {
+    const p = sandboxPaths();
+    for (const dir of [p.root, p.sshDir, p.sshAgentDir, p.sshIdentityDir,
+                       p.stateDir, p.tmpDir, p.lockDir]) {
+      _nodeFs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      // mkdir mode is masked by umask on some platforms; force the bits
+      // back in case the sandbox was created with looser perms.
+      try {
+        _nodeFs.chmodSync(dir, 0o700);
+      } catch { /* best-effort; not all FS support chmod */ }
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err && err.message || String(err) };
+  }
+}
+
+// migrateFromHome — opt-in one-shot copy of the user's existing
+// ~/.ssh/config, ~/.ssh/known_hosts and referenced identity files into
+// the sandbox. Triggered by AGENT_SSH_IMPORT_FROM_HOME=1; otherwise
+// returns false immediately and does nothing. Never overwrites an
+// existing sandbox file (the source of truth for the sandbox is
+// already-migrated state, not the live user home). Writes a single
+// audit-style log line "migration: imported N files from $HOME/.ssh/"
+// to the bootstrap log via the existing bootstrapDebug() helper.
+// Reads profiles.json for referenced IdentityFile paths; if none are
+// found AND AGENT_SSH_FALLBACK_KEYS is set, also copies the fallback
+// identity list (~/id_ed25519, ~/id_rsa, ~/HPE_Pvt_key).
+async function migrateFromHome() {
+  if (process.env.AGENT_SSH_IMPORT_FROM_HOME !== "1") return false;
+  let imported = 0;
+  let skipped = 0;
+  try {
+    const ensured = await ensureSandbox();
+    if (!ensured.ok) {
+      bootstrapDebug(`migration: failed to ensure sandbox: ${ensured.error}`);
+      return false;
+    }
+    const p = sandboxPaths();
+    const homeSsh = _nodePath.join(_nodeOs.homedir(), ".ssh");
+
+    // helper: copy src->dst, creating dst parent. Returns true on copy,
+    // false on skip (target exists), null on source-missing.
+    function _tryCopy(src, dst) {
+      if (!_nodeFs.existsSync(src)) return null;
+      _nodeFs.mkdirSync(_nodePath.dirname(dst), { recursive: true, mode: 0o700 });
+      if (_nodeFs.existsSync(dst)) {
+        skipped++;
+        bootstrapDebug(`migration: skip existing ${dst}`);
+        return false;
+      }
+      _nodeFs.copyFileSync(src, dst);
+      try { _nodeFs.chmodSync(dst, 0o600); } catch { /* best-effort */ }
+      imported++;
+      return true;
+    }
+
+    // 1. ssh config + known_hosts
+    _tryCopy(_nodePath.join(homeSsh, "config"),     p.config);
+    _tryCopy(_nodePath.join(homeSsh, "known_hosts"), p.knownHosts);
+
+    // 2. identities referenced by profiles.json
+    const seen = new Set();
+    const profileRefs = [];
+    try {
+      if (_nodeFs.existsSync(p.profilesFile)) {
+        const data = JSON.parse(_nodeFs.readFileSync(p.profilesFile, "utf8"));
+        const profiles = (data && data.profiles) || {};
+        for (const name of Object.keys(profiles)) {
+          const prof = profiles[name];
+          if (prof && typeof prof.identityFile === "string") {
+            profileRefs.push(prof.identityFile);
+          }
+        }
+      }
+    } catch { /* malformed profiles.json — ignore, fall back to fallbacks */ }
+
+    // 3. fallback identities — only when no profile refs AND env set
+    const useFallback = profileRefs.length === 0
+                        && !!process.env.AGENT_SSH_FALLBACK_KEYS;
+    const candidates = useFallback
+      ? p.fallbackIdentityFiles
+      : profileRefs;
+
+    for (const candidate of candidates) {
+      const expanded = candidate.startsWith("~")
+        ? _nodeOs.homedir() + candidate.slice(1)
+        : candidate;
+      const base = _nodePath.basename(expanded);
+      if (seen.has(base)) continue;
+      seen.add(base);
+      _tryCopy(expanded, _nodePath.join(p.sshIdentityDir, base));
+    }
+
+    bootstrapDebug(`migration: imported ${imported} files from $HOME/.ssh/ (skipped ${skipped})`);
+    return true;
+  } catch (err) {
+    bootstrapDebug(`migration: failed: ${err && err.message || err}`);
+    return false;
+  }
+}
+
 // ---- constants ---------------------------------------------------------
 
 const SSH_STATUS_KEY = "ssh-tools";
+const _SANDBOX = sandboxPaths();
 const SSH_TOOL_NAMES = ["ssh_target_select", "ssh_read", "ssh_write", "ssh_edit", "ssh_bash", "ssh_scp"];
-const SSH_CONFIG_PATH = _nodePath.join(_nodeOs.homedir(), ".ssh", "config");
-const PROFILES_FILE = _nodePath.join(_nodeOs.homedir(), ".config", "agent-ssh-tools", "profiles.json");
+const SSH_CONFIG_PATH = _SANDBOX.config;
+const PROFILES_FILE = _SANDBOX.profilesFile;
 const DEFAULT_PROBE_SECONDS = 8; // bumped from 6: gives the agent-bootstrap path enough slack on slow CI runners
 const DEFAULT_SSH_TIMEOUT_SECONDS = 30;
 const DEFAULT_SCP_TIMEOUT_SECONDS = 600;
 const DEFAULT_EXPECTED_SCP_THROUGHPUT_BPS = 12_500_000; // 12 MB/s — reasonable WAN estimate
 const DEFAULT_SCP_BUFFER_SECONDS = 60;
-const BOOTSTRAP_LOG_PATH = _nodePath.join(_nodeOs.homedir(), ".config", "agent-ssh-tools", "agent-bootstrap.log");
-const FALLBACK_IDENTITY_FILES = ["~/.ssh/id_ed25519", "~/.ssh/id_rsa", "~/.ssh/HPE_Pvt_key"];
+const BOOTSTRAP_LOG_PATH = _SANDBOX.bootstrapLog;
+const FALLBACK_IDENTITY_FILES = _SANDBOX.fallbackIdentityFiles;
+
 // omp's renderCallback signature is (args, options, theme); upstream pi is
 // (args, theme, context). Sniff the 2nd arg: if it has a .fg() method it's
 // the theme, otherwise it's the options object and the theme is the 3rd.
@@ -41,25 +195,60 @@ function _pickTheme(a, b, c) {
 
 // ---- ssh agent bootstrap ----------------------------------------------
 
-// Append a one-line timestamped entry to ~/.config/agent-ssh-tools/agent-bootstrap.log.
+
+function ensureSandboxAgentDir() {
+  const p = sandboxPaths().sshAgentDir;
+  try {
+    _nodeFs.mkdirSync(p, { recursive: true, mode: 0o700 });
+    try { _nodeFs.chmodSync(p, 0o700); } catch { /* already correct */ }
+  } catch (err) {
+    bootstrapDebug(`ensureSandboxAgentDir: mkdir failed (${err && err.message})`);
+    return false;
+  }
+  return true;
+}
+
+// Module-internal sandbox state. Holds the ssh-agent's socket and PID
+// exclusively in memory — process.env is NEVER written to here. Other
+// slices (env, known-hosts, audit) are free to read sandboxState directly.
+const sandboxState = {
+  sshAuthSock: "",
+  sshAgentPid: 0,
+  // Resolved cache key: $AGENT_SSH_ROOT + process.pid. One agent per omp session.
+  cacheKey: "",
+};
+
+// Build the cache key once. process.pid is stable for the lifetime of the
+// omp process; AGENT_SSH_ROOT is read on first call so env overrides win.
+function _sandboxCacheKey() {
+  if (!sandboxState.cacheKey) {
+    sandboxState.cacheKey = sandboxPaths().root + ":" + process.pid;
+  }
+  return sandboxState.cacheKey;
+}
+
+// Append a one-line timestamped entry to $AGENT_SSH_ROOT/state/agent-bootstrap.log.
 // Never throws — logging failures must never break the SSH path.
 function bootstrapDebug(msg) {
   try {
-    _nodeFs.mkdirSync(_nodePath.dirname(BOOTSTRAP_LOG_PATH), { recursive: true });
+    const logPath = sandboxPaths().bootstrapLog;
+    _nodeFs.mkdirSync(_nodePath.dirname(logPath), { recursive: true, mode: 0o700 });
     const stamp = new Date().toISOString();
-    _nodeFs.appendFileSync(BOOTSTRAP_LOG_PATH, `[${stamp}] ${msg}\n`, { mode: 0o600 });
+    _nodeFs.appendFileSync(logPath, `[${stamp}] ${msg}\n`, { mode: 0o600 });
   } catch { /* ignore */ }
 }
 
-// Probe the current SSH_AUTH_SOCK: synchronous, returns whether the agent
-// responds AND whether it has at least one identity. The agent's response
-// to `ssh-add -l` distinguishes "agent alive but empty" from "no agent".
+// Probe the extension-owned ssh-agent. Returns { alive, identities, sock, reason }.
+// Reads exclusively from sandboxState — process.env.SSH_AUTH_SOCK is NEVER
+// consulted. The agent's response to `ssh-add -l` distinguishes "agent
+// alive but empty" from "no agent".
 function sshAgentAlive() {
-  const sock = process.env.SSH_AUTH_SOCK;
-  if (!sock) return { alive: false, identities: 0, sock: "", reason: "SSH_AUTH_SOCK unset" };
+  const sock = sandboxState.sshAuthSock;
+  if (!sock) return { alive: false, identities: 0, sock: "", reason: "sandboxState.sshAuthSock unset" };
   if (!_nodeFs.existsSync(sock)) return { alive: false, identities: 0, sock, reason: "socket missing" };
   const r = _nodeChild_process.spawnSync("ssh-add", ["-l"], {
     encoding: "utf8", timeout: 3000,
+    env: { ...process.env, SSH_AUTH_SOCK: sock },
   });
   if (r.error) return { alive: false, identities: 0, sock, reason: `ssh-add error: ${r.error.message}` };
   if (r.status === 0) {
@@ -76,11 +265,20 @@ function sshAgentAlive() {
   return { alive: false, identities: 0, sock, reason: `ssh-add exit ${r.status}: ${errOut.split("\n")[0]}` };
 }
 
-// Start a fresh ssh-agent. Parses the `SSH_AUTH_SOCK=...; export ...;` lines
-// from `ssh-agent -s` (POSIX shell syntax). Returns the env vars to set or
-// null on failure. Never throws.
+// Spawn a fresh extension-owned ssh-agent under sandboxPaths().sshAgentDir.
+// Forces the socket via `-a <socketPath>` and daemonizes with `-D` so the
+// parent shell exits immediately while the agent keeps running in the
+// background. Parses the SSH_AUTH_SOCK / SSH_AGENT_PID from the eval output
+// (which reflects the -a override) so callers can record them in
+// sandboxState. Never throws; returns null on any failure.
 function startSshAgent() {
-  const r = _nodeChild_process.spawnSync("ssh-agent", ["-s"], {
+  if (!ensureSandboxAgentDir()) return null;
+  const cacheKey = _sandboxCacheKey();
+  const socketPath = _nodePath.join(sandboxPaths().sshAgentDir, `agent.${process.pid}.sock`);
+  // Defensive cleanup: stale socket from a previous run that crashed
+  // without unlinking it. ssh-agent refuses to start if the path exists.
+  try { _nodeFs.unlinkSync(socketPath); } catch { /* not present */ }
+  const r = _nodeChild_process.spawnSync("ssh-agent", ["-D", "-a", socketPath, "-s"], {
     encoding: "utf8", timeout: 5000,
   });
   if (r.error || r.status !== 0) {
@@ -89,28 +287,49 @@ function startSshAgent() {
   }
   const out = r.stdout || "";
   let sock = "";
-  let pid = "";
+  let pid = 0;
   for (const line of out.split("\n")) {
     const sockMatch = line.match(/SSH_AUTH_SOCK=([^;]+?);/);
     if (sockMatch) sock = sockMatch[1].trim();
     const pidMatch  = line.match(/SSH_AGENT_PID=([^;]+?);/);
-    if (pidMatch)  pid  = pidMatch[1].trim();
+    if (pidMatch)  pid  = parseInt(pidMatch[1].trim(), 10) || 0;
   }
-  if (!sock || !pid) {
-    bootstrapDebug(`startSshAgent: could not parse export lines from:\n${out}`);
+  // Fall back to the path we forced via -a and the value we cached from the
+  // current process. The eval line is the authoritative source, but if
+  // parsing fails the agent is still running and we want to record what
+  // we asked for rather than discard the agent.
+  if (!sock) sock = socketPath;
+  // Confirm the socket actually appeared before we trust the eval line.
+  // ssh-agent -D forks and the parent exits 0 only after the child has
+  // bound the socket, but a probe is cheap and surfaces race conditions
+  // (or stale-path binds) immediately.
+  if (!_nodeFs.existsSync(sock)) {
+    bootstrapDebug(`startSshAgent: socket ${sock} not present after start, output was:\n${out}`);
+    // Best-effort cleanup of the daemon we just started; we don't know pid
+    // if parsing failed, so fall back to a pkill of any orphan on socket.
+    if (pid > 0) { try { process.kill(pid, "SIGTERM"); } catch { /* gone */ } }
     return null;
   }
+  if (!pid) {
+    bootstrapDebug(`startSshAgent: no SSH_AGENT_PID parsed from eval line; socket=${sock}`);
+    return null;
+  }
+  void cacheKey; // cacheKey is recorded into sandboxState by the caller
   return { sock, pid };
 }
 
-// Try to add a single key. Returns { ok, reason }. Passphrase-protected keys
-// fail with a non-zero exit; we treat that as "skip, try next" and never
-// block on a missing pinentry. STDIN is closed immediately to prevent
-// ssh-add from waiting for a passphrase on the terminal.
+// Try to add a single key to the extension-owned agent. Uses sandboxState
+// exclusively; process.env is left untouched. Returns { ok, reason }.
+// Passphrase-protected keys fail with a non-zero exit; we treat that as
+// "skip, try next" and never block on a missing pinentry. STDIN is closed
+// immediately to prevent ssh-add from waiting for a passphrase on the
+// terminal.
 function sshAddKey(keyPath) {
+  const env = { ...process.env, SSH_AUTH_SOCK: sandboxState.sshAuthSock };
   const r = _nodeChild_process.spawnSync("ssh-add", [keyPath], {
     encoding: "utf8", timeout: 5000,
     stdio: ["ignore", "pipe", "pipe"],
+    env,
   });
   if (r.status === 0) return { ok: true, reason: "" };
   const errOut = ((r.stderr || "") + " " + (r.stdout || "")).trim();
@@ -125,7 +344,7 @@ function sshAddKey(keyPath) {
 function resolveIdentityFileForAlias(aliasOrHost) {
   if (aliasOrHost && typeof aliasOrHost === "string") {
     try {
-      const r = _nodeChild_process.spawnSync("ssh", ["-G", aliasOrHost], {
+      const r = _nodeChild_process.spawnSync("ssh", ["-G", aliasOrHost, "-F", sandboxPaths().sshConfig], {
         encoding: "utf8", timeout: 4000,
       });
       if (r.status === 0) {
@@ -151,86 +370,301 @@ function resolveIdentityFileForAlias(aliasOrHost) {
   return "";
 }
 
-// resolveSshAgent: makes sure SSH_AUTH_SOCK points at a working agent with
-// at least one identity. Three-step pipeline (each idempotent):
-//   1. If SSH_AUTH_SOCK is set AND the agent has identities: done.
-//   2. Otherwise start `ssh-agent -s`, set env, retry ssh-add -l.
-//   3. ssh-add IdentityFile from ssh-config (or hardcoded fallback list),
-//      skipping passphrase-protected keys. Returns { ok, sock, tried }.
-//
-// Mutates process.env.SSH_AUTH_SOCK / SSH_AGENT_PID so every subsequent
-// spawn picks them up via the explicit env object we pass (see buildSshEnv).
-// Cached by resolved sock path so re-entrant calls don't re-add the same key.
-let _bootstrapDoneForSock = "";
 function resolveSshAgent(opts) {
   opts = opts || {};
   const aliasOrHost = opts.sshConfigAlias || opts.alias || opts.host || "";
-  const existing = sshAgentAlive();
-  if (existing.alive && existing.identities > 0) {
-    _bootstrapDoneForSock = existing.sock;
-    bootstrapDebug(`resolveSshAgent: agent alive sock=${existing.sock} identities=${existing.identities}`);
-    return { ok: true, sock: existing.sock, pid: process.env.SSH_AGENT_PID || "", tried: [] };
-  }
-  if (_bootstrapDoneForSock && _bootstrapDoneForSock === (process.env.SSH_AUTH_SOCK || "") && existing.alive) {
-    // Idempotent: already bootstrapped against the same sock this turn.
-    return { ok: existing.identities > 0, sock: process.env.SSH_AUTH_SOCK || "", pid: process.env.SSH_AGENT_PID || "", tried: [] };
-  }
-  bootstrapDebug(`resolveSshAgent: starting ssh-agent (was alive=${existing.alive}, identities=${existing.identities}, reason=${existing.reason})`);
-  const started = startSshAgent();
-  if (!started) {
-    bootstrapDebug("resolveSshAgent: ssh-agent -s failed to start");
-    return { ok: false, sock: process.env.SSH_AUTH_SOCK || "", pid: "", tried: [], reason: "ssh-agent failed to start" };
-  }
-  process.env.SSH_AUTH_SOCK = started.sock;
-  process.env.SSH_AGENT_PID = started.pid;
-  _bootstrapDoneForSock = started.sock;
 
-  const identityFile = resolveIdentityFileForAlias(aliasOrHost);
-  const tried = [];
-  if (identityFile) {
-    const r = sshAddKey(identityFile);
-    tried.push({ file: identityFile, ok: r.ok, reason: r.reason });
-    bootstrapDebug(`resolveSshAgent: ssh-add ${identityFile} ok=${r.ok} ${r.reason}`);
+// resolveSshAgent: makes sure the extension-owned ssh-agent under the
+// sandbox is running with at least one identity. process.env is NEVER
+// consulted or mutated: the agent's socket/PID live exclusively in
+// sandboxState. Cache key is $AGENT_SSH_ROOT + process.pid so each omp
+// session gets exactly one agent.
+//
+// Pipeline:
+//   1. Drop any inherited SSH_AUTH_SOCK / SSH_AGENT_PID from process.env
+//      so the inherited user agent can never leak into our children.
+//   2. If sandboxState already has a live agent with identities: return it.
+//   3. Otherwise start a new ssh-agent under sandboxPaths().sshAgentDir,
+//      add the resolved IdentityFile (then fallbacks), probe. On a
+//      post-start probe failure we cleanup + retry at most once before
+//      surfacing a clear error.
+//
+// Returns { ok, sock?, pid?, reason?, tried? }.
+
+  // First and non-negotiable step: drop any SSH_AUTH_SOCK / SSH_AGENT_PID
+  // inherited from the parent shell. process.env must never carry these
+  try { delete process.env.SSH_AGENT_PID; } catch { /* non-configurable */ process.env.SSH_AGENT_PID = ""; }
+  try { delete process.env.SSH_AUTH_SOCK; } catch { /* non-configurable */ process.env.SSH_AUTH_SOCK = ""; }
+
+
+  // Cache hit: same omp session, agent already bootstrapped.
+  const existing = sshAgentAlive();
+  if (existing.alive && existing.identities > 0 && sandboxState.sshAuthSock) {
+    bootstrapDebug(`resolveSshAgent: cache hit sock=${existing.sock} identities=${existing.identities}`);
+    return { ok: true, sock: existing.sock, pid: sandboxState.sshAgentPid, tried: [] };
   }
-  // If we still have no identities, try the fallback list (skip duplicates).
-  const after = sshAgentAlive();
-  if (!after.alive || after.identities === 0) {
-    for (const candidate of FALLBACK_IDENTITY_FILES) {
-      const p = candidate.startsWith("~") ? _nodeOs.homedir() + candidate.slice(1) : candidate;
-      if (p === identityFile) continue;
-      if (!_nodeFs.existsSync(p)) continue;
-      const r = sshAddKey(p);
-      tried.push({ file: p, ok: r.ok, reason: r.reason });
-      bootstrapDebug(`resolveSshAgent: fallback ssh-add ${p} ok=${r.ok} ${r.reason}`);
-      const check = sshAgentAlive();
-      if (check.identities > 0) break;
+
+  // Attempt the bootstrap. On post-start probe failure we get one retry.
+  let attempt = 0;
+  while (attempt < 2) {
+    attempt += 1;
+    bootstrapDebug(`resolveSshAgent: starting ssh-agent attempt=${attempt} (was alive=${existing.alive}, identities=${existing.identities}, reason=${existing.reason})`);
+    // Tear down any half-state from a previous attempt before retrying.
+    if (attempt > 1) cleanupSshAgent();
+    const started = startSshAgent();
+    if (!started) {
+      bootstrapDebug(`resolveSshAgent: ssh-agent -s failed to start (attempt ${attempt})`);
+      if (attempt >= 2) {
+        return { ok: false, sock: "", pid: 0, tried: [], reason: "ssh-agent failed to start" };
+      }
+      continue;
     }
+    sandboxState.sshAuthSock = started.sock;
+    sandboxState.sshAgentPid = started.pid;
+
+    const identityFile = resolveIdentityFileForAlias(aliasOrHost);
+    const tried = [];
+    if (identityFile) {
+      const r = sshAddKey(identityFile);
+      tried.push({ file: identityFile, ok: r.ok, reason: r.reason });
+      bootstrapDebug(`resolveSshAgent: ssh-add ${identityFile} ok=${r.ok} ${r.reason}`);
+    }
+    // If we still have no identities, try the fallback list (skip duplicates).
+    const after = sshAgentAlive();
+    if (!after.alive || after.identities === 0) {
+      for (const candidate of FALLBACK_IDENTITY_FILES) {
+        const p = candidate.startsWith("~") ? _nodeOs.homedir() + candidate.slice(1) : candidate;
+        if (p === identityFile) continue;
+        if (!_nodeFs.existsSync(p)) continue;
+        const r = sshAddKey(p);
+        tried.push({ file: p, ok: r.ok, reason: r.reason });
+        bootstrapDebug(`resolveSshAgent: fallback ssh-add ${p} ok=${r.ok} ${r.reason}`);
+        const check = sshAgentAlive();
+        if (check.identities > 0) break;
+      }
+    }
+    const final = sshAgentAlive();
+    // Probe-after-start sanity check. If the agent died between start and
+    // probe (e.g. crashed during key-add), cleanup and retry exactly once.
+    if (!final.alive) {
+      bootstrapDebug(`resolveSshAgent: agent died after start (attempt ${attempt}) — cleaning up`);
+      cleanupSshAgent();
+      if (attempt >= 2) {
+        return { ok: false, sock: "", pid: 0, tried, reason: "ssh-agent crashed after start" };
+      }
+      continue;
+    }
+    bootstrapDebug(`resolveSshAgent: done sock=${sandboxState.sshAuthSock} pid=${sandboxState.sshAgentPid} identities=${final.identities} tried=${tried.length}`);
+    return {
+      ok: final.identities > 0,
+      sock: sandboxState.sshAuthSock,
+      pid: sandboxState.sshAgentPid,
+      tried,
+      identityFile,
+    };
   }
-  const final = sshAgentAlive();
-  bootstrapDebug(`resolveSshAgent: done sock=${process.env.SSH_AUTH_SOCK} identities=${final.identities} tried=${tried.length}`);
-  return {
-    ok: final.identities > 0,
-    sock: process.env.SSH_AUTH_SOCK || "",
-    pid: process.env.SSH_AGENT_PID || "",
-    tried,
-    identityFile,
-  };
+  // Unreachable: the loop returns or continues on every path.
+  return { ok: false, sock: "", pid: 0, tried: [], reason: "resolveSshAgent: exhausted attempts" };
 }
 
-// Build the explicit env object passed to every ssh/scp child. We DO NOT
-// rely on process.env inheritance — sessions started by editors, CI
-// runners, or detached launchers often have a stripped env that hides
-// SSH_AUTH_SOCK and friends. Force them to current process.env values
-// (which resolveSshAgent has populated) so children always see them.
-function buildSshEnv() {
-  const env = { ...process.env };
-  if (process.env.SSH_AUTH_SOCK) env.SSH_AUTH_SOCK = process.env.SSH_AUTH_SOCK;
-  if (process.env.SSH_AGENT_PID) env.SSH_AGENT_PID = process.env.SSH_AGENT_PID;
-  if (process.env.HOME)         env.HOME         = process.env.HOME;
-  if (process.env.USER)         env.USER         = process.env.USER;
-  if (process.env.LOGNAME)      env.LOGNAME      = process.env.LOGNAME;
+// Tear down the extension-owned ssh-agent. Idempotent. SIGTERMs the pid,
+// unlinks the socket, clears sandboxState. Safe to call repeatedly and
+// from process-exit handlers.
+let _cleanupRegistered = false;
+function cleanupSshAgent() {
+  const pid = sandboxState.sshAgentPid;
+  const sock = sandboxState.sshAuthSock;
+  if (pid > 0) {
+    try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
+    // Reap: a tiny grace period then SIGKILL if still around.
+    setTimeout(() => {
+      try { process.kill(pid, 0); process.kill(pid, "SIGKILL"); } catch { /* gone */ }
+    }, 500).unref?.();
+  }
+  if (sock) {
+    try { _nodeFs.unlinkSync(sock); } catch { /* not present */ }
+  }
+  sandboxState.sshAuthSock = "";
+  sandboxState.sshAgentPid = 0;
+  bootstrapDebug(`cleanupSshAgent: pid=${pid} sock=${sock} torn down`);
+}
+
+// Register cleanup hooks. Called once on module load. session_end is the
+// preferred lifecycle event (fires when the omp session terminates);
+// process 'exit' / SIGTERM / SIGINT are fallbacks for hard kills.
+function _registerCleanupHooks(pi) {
+  if (_cleanupRegistered) return;
+  _cleanupRegistered = true;
+  const handler = () => { try { cleanupSshAgent(); } catch { /* best-effort */ } };
+  if (pi && typeof pi.on === "function") {
+    try { pi.on("session_end", handler); } catch { /* event name unsupported */ }
+    try { pi.on("shutdown", handler); } catch { /* event name unsupported */ }
+  }
+  process.on("exit", handler);
+  process.on("SIGTERM", handler);
+  process.on("SIGINT", handler);
+}
+
+// Allowlist-only env for every ssh/scp child (Slice C).
+//
+// We deliberately do NOT `...process.env` spread — the omp parent may carry
+// tokens (AWS_*, GITHUB_TOKEN, OMP_INTERNAL_*) that the ssh child must never
+// see. We also explicitly exclude DISPLAY (no X11-forward), LD_PRELOAD (no
+// lib hijacking), and SSH_ASKPASS (no interactive passphrase prompts).
+//
+// Variables (and nothing else):
+//   PATH              — process.env.PATH (system path); "" if unset
+//   LANG              — process.env.LANG (locale for ssh error messages)
+//   TERM              — process.env.TERM (so `clear` and friends work)
+//   TZ                — process.env.TZ (so remote `date` matches local)
+//   HOME              — sandboxPaths().root (so ~/ resolves into the sandbox)
+//   USER              — process.env.USER
+//   LOGNAME           — process.env.LOGNAME
+//   SSH_AUTH_SOCK     — sandboxState.sshAuthSock (sandbox-owned agent socket)
+//   SSH_AGENT_PID     — sandboxState.sshAgentPid (sandbox-owned agent pid)
+function sandboxEnv() {
+  const env = {};
+  env.PATH    = process.env.PATH || "";
+  if (process.env.LANG)    env.LANG    = process.env.LANG;
+  if (process.env.TERM)    env.TERM    = process.env.TERM;
+  if (process.env.TZ)      env.TZ      = process.env.TZ;
+  env.HOME    = sandboxPaths().root;
+  if (process.env.USER)    env.USER    = process.env.USER;
+  if (process.env.LOGNAME) env.LOGNAME = process.env.LOGNAME;
+  if (sandboxState.sshAuthSock) env.SSH_AUTH_SOCK = sandboxState.sshAuthSock;
+  if (sandboxState.sshAgentPid) env.SSH_AGENT_PID = String(sandboxState.sshAgentPid);
   return env;
 }
+
+// StrictHostKeyChecking flag pair for ssh / scp invocations.
+// Default: StrictHostKeyChecking=yes (fail closed on unknown host, NEVER
+// auto-trust). The first connect to a host fails unless the host key is
+// already in the sandbox known_hosts — an empty known_hosts + yes = zero
+// trust. That is intentional: it forces the user (not the agent) to
+// pre-populate known_hosts via the migration / profile preload flow.
+//
+// Optional relax via env AGENT_SSH_STRICT_HOSTKEY=accept-new: first connect
+// auto-trusts and writes the host key into sandbox known_hosts. Anything
+// else (or unset) is treated as "yes".
+function strictHostKeyArgs() {
+  const v = (process.env.AGENT_SSH_STRICT_HOSTKEY || "yes").toLowerCase();
+  if (v === "accept-new") return ["-o", "StrictHostKeyChecking=accept-new"];
+  if (v === "no")         return ["-o", "StrictHostKeyChecking=no"];
+  return ["-o", "StrictHostKeyChecking=yes"];
+}
+
+// UserKnownHostsFile flag pair — point ssh / scp at the sandbox known_hosts
+// file instead of ~/.ssh/known_hosts. Always present, never optional.
+function knownHostsFileArg() {
+  return ["-o", `UserKnownHostsFile=${sandboxPaths().knownHosts}`];
+}
+// ---- sandbox: env allowlist + concurrent profile lock + audit meta ---
+
+// sandboxEnv() — Slice C provides the real implementation. Slice D only
+// consumes it (envHash). The function already exists in this file (see
+// Slice C); we do not redeclare it here.
+
+// withProfileLock — module-internal mutex on a per-profile directory.
+// mkdir is atomic on POSIX (mkdir(2) with O_EXCL semantics): if the lock
+// directory already exists, mkdirSync throws EEXIST and we know another
+// holder is active. We retry every 50ms up to a 5s deadline; on timeout
+// we throw with a clear reason so the calling tool surfaces it to the
+// agent instead of hanging silently. Cleanup: rmdir the lock dir on the
+// happy path; if the holder process crashes between mkdir and rmdir the
+// lock self-heals on the next process restart (the holder is dead, the
+// directory is stale, mkdir on the next call succeeds).
+//
+// Lock-path: sandboxPaths().lockDir/<profileName>.lock — one lock per
+// profile so two ssh_bash calls on different profiles run in parallel.
+// profileName is sanitized to basename+alnum to keep a malicious caller
+// from injecting path separators into the lock path.
+const LOCK_RETRY_INTERVAL_MS = 50;
+const LOCK_TIMEOUT_MS = 5000;
+// Replace anything outside [A-Za-z0-9._-] with '_'. Defensive: profileName
+// should be a known-safe alias from profiles.json / ssh-config, but a
+// hostile target.name must never reach the filesystem.
+const SAFE_PROFILE_LOCK_RE = /[^A-Za-z0-9._-]/g;
+async function withProfileLock(profileName, fn) {
+  const lockDir = sandboxPaths().lockDir;
+  // Ensure lockDir exists with mode 0700. mkdirSync recursive is
+  // idempotent; mode is best-effort (umask may mask on some platforms)
+  // so we chmod afterwards.
+  try {
+    _nodeFs.mkdirSync(lockDir, { recursive: true, mode: 0o700 });
+    try { _nodeFs.chmodSync(lockDir, 0o700); } catch { /* best-effort */ }
+  } catch (err) {
+    throw new Error(`withProfileLock: cannot create lock dir '${lockDir}': ${err && err.message || err}`);
+  }
+  const safeName = String(profileName || "").replace(SAFE_PROFILE_LOCK_RE, "_") || "default";
+  const lockPath = _nodePath.join(lockDir, `${safeName}.lock`);
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  // Spinning retry: try to claim the lock by mkdir. If EEXIST we wait.
+  while (true) {
+    try {
+      // mkdirSync without recursive throws EEXIST when the directory is
+      // already there — exactly the atomic-claim semantics we want.
+      _nodeFs.mkdirSync(lockPath, { mode: 0o700 });
+      break; // got it
+    } catch (err) {
+      if (err && err.code !== "EEXIST") {
+        throw new Error(`withProfileLock: unexpected error claiming '${lockPath}': ${err.message || err}`);
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `withProfileLock: timeout after ${LOCK_TIMEOUT_MS}ms acquiring lock for profile '${profileName}' at '${lockPath}'`
+        );
+      }
+      const { promise: waitPromise, resolve: waitResolve } = Promise.withResolvers<void>();
+      setTimeout(waitResolve, LOCK_RETRY_INTERVAL_MS);
+      await waitPromise;
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    // Best-effort cleanup. If rmdir fails (e.g. someone else rmrf'd the
+    // sandbox), the next call will still see the directory and skip —
+    // not a correctness problem, just stale-state cosmetics.
+    try { _nodeFs.rmdirSync(lockPath); } catch { /* best-effort */ }
+  }
+}
+
+// _auditMeta — produces the two new TSV fields every audit row needs:
+//   envHash    = sha256(keys(sandboxEnv()).sort().join('|')).slice(0,12)
+//   sandboxRoot = basename of sandboxPaths().root
+// Both are diagnostic-only: envHash shows which keys were active at the
+// moment of the call (so the user can correlate an op with the agent's
+// env-allowlist state without leaking values), sandboxRoot tags the
+// record to the right sandbox when multiple omp sessions coexist.
+function _auditMeta() {
+  let envHash = "";
+  try {
+    const env = sandboxEnv();
+    const keys = Object.keys(env).sort();
+    envHash = _nodeCrypto.createHash("sha256").update(keys.join("|")).digest("hex").slice(0, 12);
+  } catch { /* leave envHash empty on failure */ }
+  let sandboxRoot = "";
+  try {
+    sandboxRoot = _nodePath.basename(sandboxPaths().root);
+  } catch { /* leave empty */ }
+  return { envHash, sandboxRoot };
+}
+
+// _writeAuditLog — append a single TSV row to sandboxPaths().auditLog.
+// Mode 0600 on the file, 0700 on the parent directory. Audit failures
+// are surfaced to the caller via thrown error so each call site can
+// decide whether to swallow (tool execution) or notify.
+function _writeAuditLog(fields) {
+  const auditLog = sandboxPaths().auditLog;
+  _nodeFs.mkdirSync(_nodePath.dirname(auditLog), { recursive: true, mode: 0o700 });
+  try { _nodeFs.chmodSync(_nodePath.dirname(auditLog), 0o700); } catch { /* best-effort */ }
+  _nodeFs.appendFileSync(auditLog, fields.join("\t") + "\n", { mode: 0o600, flag: "a" });
+  try { _nodeFs.chmodSync(auditLog, 0o600); } catch { /* best-effort */ }
+}
+
+
+
+
 
 // ---- shell quoting -----------------------------------------------------
 
@@ -438,7 +872,7 @@ function normalizeTargetArg(arg) {
     if (sshConfigAlias) {
       try {
         const r = _nodeChild_process.spawnSync(
-          "ssh", ["-G", sshConfigAlias],
+          "ssh", ["-G", sshConfigAlias, "-F", sandboxPaths().sshConfig],
           { encoding: "utf8", timeout: 5000 }
         );
         if (r.status === 0) {
@@ -516,7 +950,9 @@ function sshExec(remote, command, options = {}) {
   return new Promise((resolve, reject) => {
     const args = [
       "-o", "BatchMode=yes",
-      "-o", "PreferredAuthentications=publickey"
+      "-o", "PreferredAuthentications=publickey",
+      ...strictHostKeyArgs(),
+      ...knownHostsFileArg(),
     ];
     if (typeof options.timeoutSeconds === "number" && options.timeoutSeconds > 0) {
       args.push("-o", `ConnectTimeout=${options.timeoutSeconds}`);
@@ -528,7 +964,7 @@ function sshExec(remote, command, options = {}) {
 
     const child = _nodeChild_process.spawn("ssh", args, {
       stdio: ["pipe", "pipe", "pipe"],
-      env: buildSshEnv()
+      env: sandboxEnv()
     });
 
     const stdoutChunks = [];
@@ -704,7 +1140,7 @@ async function probe(remote, seconds = DEFAULT_PROBE_SECONDS, sshConfigAlias?: s
     let parsed: { hostname: string; port: number; user?: string; identityFile?: string } | null = null;
     try {
       const r = _nodeChild_process.spawnSync(
-        "ssh", ["-G", sshConfigAlias],
+        "ssh", ["-G", sshConfigAlias, "-F", sandboxPaths().sshConfig],
         { encoding: "utf8", timeout: 5000 }
       );
       if (r.status === 0) {
@@ -798,13 +1234,15 @@ async function probe(remote, seconds = DEFAULT_PROBE_SECONDS, sshConfigAlias?: s
     "-o", `ConnectTimeout=${seconds}`,
     "-o", "BatchMode=yes",
     "-o", "PreferredAuthentications=publickey",
+    ...strictHostKeyArgs(),
+    ...knownHostsFileArg(),
     ...(resolvedIdentityFile ? ["-i", resolvedIdentityFile] : []),
     ...(resolvedUser       ? ["-l", resolvedUser]         : []),
     ...(resolvedPort && resolvedPort !== 22 ? ["-p", String(resolvedPort)] : []),
     ip, "whoami"
   ];
   return new Promise(resolve => {
-    const proc = _nodeChild_process.spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"], env: buildSshEnv() });
+    const proc = _nodeChild_process.spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"], env: sandboxEnv() });
     let stdout = "", stderr = "";
     let killed = false;
     const killTimer = setTimeout(() => {
@@ -844,7 +1282,7 @@ async function probe(remote, seconds = DEFAULT_PROBE_SECONDS, sshConfigAlias?: s
 // Returns the IdentityFile ssh would use for `host` per `ssh -G`.
 function identityFileFor(host) {
   try {
-    const r = _nodeChild_process.spawnSync("ssh", ["-G", host], { encoding: "utf8" });
+    const r = _nodeChild_process.spawnSync("ssh", ["-G", host, "-F", sandboxPaths().sshConfig], { encoding: "utf8" });
     if (r.status !== 0) return "";
     const m = r.stdout.split("\n").find(l => /^identityfile\s+/i.test(l));
     if (!m) return "";
@@ -1068,8 +1506,11 @@ async function scpTransfer(target, direction, source, destination, recursive, ti
   const flags = ["-v"];
   if (recursive) flags.push("-r");
   if (isCompressiblePath(source)) flags.push("-C");
-  // Pass ssh options so scp's internal ssh uses BatchMode + publickey.
+  // Pass ssh options so scp's internal ssh uses BatchMode + publickey + our
+  // sandbox-scoped known_hosts + the configured StrictHostKeyChecking policy.
   flags.push("-o", "BatchMode=yes", "-o", "PreferredAuthentications=publickey");
+  for (const a of strictHostKeyArgs()) flags.push(a);
+  for (const a of knownHostsFileArg()) flags.push(a);
   if (target.identityFile) flags.push("-o", `IdentityFile=${target.identityFile}`);
   if (target.user) flags.push("-o", `User=${target.user}`);
   if (target.port && target.port !== 22) flags.push("-P", String(target.port));
@@ -1094,7 +1535,7 @@ async function scpTransfer(target, direction, source, destination, recursive, ti
   }
   return new Promise((resolve) => {
     const t0 = Date.now();
-    const child = _nodeChild_process.spawn("scp", args, { stdio: ["pipe", "pipe", "pipe"], env: buildSshEnv() });
+    const child = _nodeChild_process.spawn("scp", args, { stdio: ["pipe", "pipe", "pipe"], env: sandboxEnv() });
     const liveStartMs = Date.now();
     const liveEnabled = process.platform === "linux" && typeof onUpdate === "function" && typeof fileSizeBytes === "number" && fileSizeBytes > 0;
     let liveTimer: any = null;
@@ -1330,6 +1771,7 @@ function sshToolsExtension(pi) {
   // agent can use them without the user typing /sshactivate first.
   // Target selection still requires ssh_target_select (probe + verify
   // runs as usual). /sshactivate off explicitly overrides.
+
   const autoActivateFromCli = (() => {
     try {
       const fromEnv = process.env.SSH_CLI_AUTO_ACTIVATE === "1";
@@ -1339,6 +1781,9 @@ function sshToolsExtension(pi) {
       return false;
     }
   })();
+  // Slice B: register ssh-agent cleanup hooks (session_end + process exit/SIGTERM/SIGINT).
+  _registerCleanupHooks(pi);
+
 
   // NOTE: we never pass the local process.cwd() to native tool
   // definitions. The local cwd is irrelevant for remote operations —
@@ -1408,7 +1853,7 @@ function sshToolsExtension(pi) {
     // 2) ssh -G — fills gaps when profile.* didn't set the field.
     if (profile.sshConfigAlias && (!resolvedUser || !resolvedIdentityFile || !resolvedPort)) {
       try {
-        const r = _nodeChild_process.spawnSync("ssh", ["-G", profile.sshConfigAlias], { encoding: "utf8", timeout: 5000 });
+        const r = _nodeChild_process.spawnSync("ssh", ["-G", profile.sshConfigAlias, "-F", sandboxPaths().sshConfig], { encoding: "utf8", timeout: 5000 });
         if (r.status === 0) {
           const lines = r.stdout.split("\n").reduce((acc, l) => {
             const kv = l.trim().split(/\s+/);
@@ -1736,60 +2181,67 @@ function sshToolsExtension(pi) {
       const cwd = target.remoteCwd;
       const cmd = params.command;
       const fullCmd = cwd ? `cd ${shellQuote(cwd)} && ${cmd}` : cmd;
-      const t0 = Date.now();
-      // Forward onUpdate so the tool result streams live. sshExec routes
-      // it through a 150ms-throttler with a 64KB visible-buffer cap so
-      // commands like `docker compose up` (thousands of layer-pull lines)
-      // don't flood the TUI. The final result.content below still holds
-      // the full output — the throttler only feeds intermediate updates.
-      const r = await sshExecVerbose(target.remote, fullCmd, {
-        timeoutSeconds: params.timeout ?? 60,
-        onUpdate,
-        identityFile: target.identityFile,
-        user: target.user,
-        port: target.port
-      });
-      const elapsed = Date.now() - t0;
-      // Audit log: append-only file with command + target + result. Lets
-      // the user audit destructive remote commands after the fact. Path:
-      // ~/.config/agent-ssh-tools/audit.log (atomic append via O_APPEND).
-      try {
-        const auditPath = _nodePath.join(_nodeOs.homedir(), ".config", "agent-ssh-tools", "audit.log");
-        _nodeFs.mkdirSync(_nodePath.dirname(auditPath), { recursive: true });
-        const stdoutHash = _nodeCrypto.createHash("sha256").update(r.stdout).digest("hex").slice(0, 12);
-        const stderrHash = _nodeCrypto.createHash("sha256").update(r.stderr).digest("hex").slice(0, 12);
-        const line = [
-          new Date().toISOString(),
-          target.name,
-          target.remote,
-          cwd || "/",
-          `exit=${r.exit}`,
-          `${elapsed}ms`,
-          `out=${stdoutHash}`,
-          `err=${stderrHash}`,
-          JSON.stringify(cmd)
-        ].join("\t") + "\n";
-        _nodeFs.appendFileSync(auditPath, line, { flag: "a" });
-      } catch (e) {
-        // Audit failures must not break tool execution.
-        ctx?.ui?.notify?.(`audit log write failed: ${(e as any)?.message ?? e}`, "warning");
-      }
-      // Output only — the renderResult composes the verbose header.
-      const parts: string[] = [];
-      if (r.stdout.length) parts.push(r.stdout.toString("utf8").trimEnd());
-      if (r.stderr.length && r.exit !== 0) parts.push(`[stderr]\n${r.stderr.toString("utf8").trimEnd()}`);
-      if (r.truncated) parts.push(`[output truncated — exceeds 10MB cap]`);
-      return {
-        content: [{ type: "text", text: parts.join("\n\n") }],
-        details: {
-          exit: r.exit,
-          elapsedMs: elapsed,
-          cwd,
-          host: target.remote,
-          cmd,
-          truncated: r.truncated
+      // Concurrent ops on the same profile serialize via withProfileLock:
+      // mkdir-spinning pattern (mkdir + EEXIST, 50ms retry, 5s deadline).
+      // The lock is held across sshExecVerbose + audit write so the audit
+      // row and the op result stay consistent under concurrent calls.
+      return withProfileLock(target.name, async () => {
+        const t0 = Date.now();
+        // Forward onUpdate so the tool result streams live. sshExec routes
+        // it through a 150ms-throttler with a 64KB visible-buffer cap so
+        // commands like `docker compose up` (thousands of layer-pull lines)
+        // don't flood the TUI. The final result.content below still holds
+        // the full output — the throttler only feeds intermediate updates.
+        const r = await sshExecVerbose(target.remote, fullCmd, {
+          timeoutSeconds: params.timeout ?? 60,
+          onUpdate,
+          identityFile: target.identityFile,
+          user: target.user,
+          port: target.port
+        });
+        const elapsed = Date.now() - t0;
+        // Audit log: append-only file with command + target + result. Lets
+        // the user audit destructive remote commands after the fact. Path:
+        // sandboxPaths().auditLog (atomic append via O_APPEND, mode 0600).
+        try {
+          const { envHash, sandboxRoot } = _auditMeta();
+          const stdoutHash = _nodeCrypto.createHash("sha256").update(r.stdout).digest("hex").slice(0, 12);
+          const stderrHash = _nodeCrypto.createHash("sha256").update(r.stderr).digest("hex").slice(0, 12);
+          _writeAuditLog([
+            new Date().toISOString(),
+            envHash,
+            sandboxRoot,
+            target.name,
+            target.remote,
+            cwd || "/",
+            `exit=${r.exit}`,
+            `${elapsed}ms`,
+            `out=${stdoutHash}`,
+            `err=${stderrHash}`,
+            JSON.stringify(cmd)
+          ]);
+        } catch (e) {
+          // Audit failures must not break tool execution.
+          const errMsg = e instanceof Error ? e.message : String(e);
+          ctx?.ui?.notify?.(`audit log write failed: ${errMsg}`, "warning");
         }
-      };
+        // Output only — the renderResult composes the verbose header.
+        const parts: string[] = [];
+        if (r.stdout.length) parts.push(r.stdout.toString("utf8").trimEnd());
+        if (r.stderr.length && r.exit !== 0) parts.push(`[stderr]\n${r.stderr.toString("utf8").trimEnd()}`);
+        if (r.truncated) parts.push(`[output truncated — exceeds 10MB cap]`);
+        return {
+          content: [{ type: "text", text: parts.join("\n\n") }],
+          details: {
+            exit: r.exit,
+            elapsedMs: elapsed,
+            cwd,
+            host: target.remote,
+            cmd,
+            truncated: r.truncated
+          }
+        };
+      });
     },
     renderCall(args, second, third) {
       const theme = _pickTheme(second, third, second);
@@ -1858,10 +2310,6 @@ function sshToolsExtension(pi) {
           description: "Set true to transfer directories (scp -r)",
           default: false
         },
-        timeoutSeconds: {
-          type: "number",
-          description: "Override scp kill timeout in seconds (default 600). Set higher for very large files."
-        }
       },
       required: ["source", "destination"]
     },
@@ -1954,111 +2402,100 @@ function sshToolsExtension(pi) {
           };
         }
       }
-      const t0 = Date.now();
-      let timeoutSeconds = params.timeoutSeconds;
-      if ((typeof timeoutSeconds !== "number" || timeoutSeconds <= 0) && typeof fileSizeBytes === "number" && fileSizeBytes > 0) {
-        timeoutSeconds = Math.ceil(fileSizeBytes / DEFAULT_EXPECTED_SCP_THROUGHPUT_BPS) + DEFAULT_SCP_BUFFER_SECONDS;
-      }
-      let r;
-      try {
-        r = await scpTransfer(
-          target, params.direction, params.source, params.destination, !!params.recursive,
-          timeoutSeconds, onUpdate, fileSizeBytes
-        );
-      } catch (e: any) {
-        return {
-          content: [{ type: "text", text: String(e?.message ?? e) }],
-          details: { ok: false, error: "scp-failed" }
-        };
-      }
-      // Verify hashes: src and dst should match for regular files
-      const sha256Match = r.sourceSha256 && r.destinationSha256 && r.sourceSha256 === r.destinationSha256;
-      // Audit log
-      try {
-        const auditPath = _nodePath.join(_nodeOs.homedir(), ".config", "agent-ssh-tools", "audit.log");
-        _nodeFs.mkdirSync(_nodePath.dirname(auditPath), { recursive: true });
-        const line = [
-          new Date().toISOString(),
-          "scp",
-          target.name,
-          target.remote,
-          params.direction,
-          `exit=${r.exitCode}`,
-          `${r.elapsedMs}ms`,
-          `src=${r.sourceSha256}`,
-          `dst=${r.destinationSha256}`,
-          `match=${sha256Match ? "yes" : "no"}`,
-          JSON.stringify(params.source),
-          "->",
-          JSON.stringify(params.destination)
-        ].join("\t") + "\n";
-        _nodeFs.appendFileSync(auditPath, line, { flag: "a" });
-      } catch { /* audit failures must not break tool */ }
-      const parts = [];
-      // Surface the actual scp command in the result so debugging is
-      // trivial: copy-paste the scp line and it works.
-      parts.push(`$ scp ${r.args.join(" ")}`);
-      if (r.exitCode !== 0) {
-        parts.push(`[scp ${direction} failed exit=${r.exitCode}]`);
-        // scp emits diagnostics on stderr ('debug1: ...', 'scp: No such
-        // file...'). Always surface stderr in failure cases so the agent
-        // sees the actual error instead of a generic exit-code message.
-        if (r.stderr.length) {
-          const stderrText = r.stderr.toString("utf8").trimEnd();
-          // Keep stderr to last ~4KB to avoid flooding output
-          const tail = stderrText.length > 4096
-            ? "…\n" + stderrText.slice(stderrText.length - 4096)
-            : stderrText;
-          parts.push(tail);
+      // Concurrent ops on the same profile serialize via withProfileLock:
+      // mkdir-spinning pattern (mkdir + EEXIST, 50ms retry, 5s deadline).
+      // The lock is held across scpTransfer + audit write so the audit
+      // row and the transfer stay consistent under concurrent calls.
+      return withProfileLock(target.name, async () => {
+        const t0 = Date.now();
+        let timeoutSeconds = params.timeoutSeconds;
+        if ((typeof timeoutSeconds !== "number" || timeoutSeconds <= 0) && typeof fileSizeBytes === "number" && fileSizeBytes > 0) {
+          timeoutSeconds = Math.ceil(fileSizeBytes / DEFAULT_EXPECTED_SCP_THROUGHPUT_BPS) + DEFAULT_SCP_BUFFER_SECONDS;
         }
-      } else {
-        parts.push(`scp ${params.direction} ok  ${r.elapsedMs}ms`);
-        // Speed/progress from scp -v summary line. Falls back gracefully
-        // if scp didn't emit the line (older versions or no -v flag).
-        if (r.sentBytes !== null && r.receivedBytes !== null) {
-          parts.push(`bytes  sent=${r.sentBytes}  received=${r.receivedBytes}`);
+        let r;
+        try {
+          r = await scpTransfer(
+            target, params.direction, params.source, params.destination, !!params.recursive,
+            timeoutSeconds, onUpdate, fileSizeBytes
+          );
+        } catch (e: any) {
+          return {
+            content: [{ type: "text", text: String(e?.message ?? e) }],
+            details: { ok: false, error: "scp-failed" }
+          };
         }
-        if (r.sentBps !== null && r.receivedBps !== null) {
-          parts.push(`speed  sent=${r.sentBps.toFixed(0)}B/s  received=${r.receivedBps.toFixed(0)}B/s`);
-        }
-        if (r.elapsedSec !== null) {
-          parts.push(`time   ${r.elapsedSec.toFixed(2)}s`);
-        }
-        if (r.sourceSha256 && r.destinationSha256) {
-          parts.push(`sha256  src=${r.sourceSha256.slice(0,12)}  dst=${r.destinationSha256.slice(0,12)}  ${sha256Match ? "MATCH" : "MISMATCH"}`);
-        }
-        if (r.elapsedSec !== null && r.elapsedSec > 0 && r.sentBytes !== null && r.sentBytes > 0) {
-          const avgBps = r.sentBytes / r.elapsedSec;
-          const avgMbS = avgBps / 1024 / 1024;
-          parts.push(`avg    ${avgMbS.toFixed(2)} MB/s  (${r.sentBytes} bytes in ${r.elapsedSec.toFixed(1)} s)`);
-          if (typeof fileSizeBytes === "number" && fileSizeBytes > 0) {
-            const projectedS = fileSizeBytes / avgBps;
-            parts.push(`eta    ~${projectedS.toFixed(0)}s for full ${(fileSizeBytes/1024/1024).toFixed(1)} MB at observed rate`);
+        // Verify hashes: src and dst should match for regular files
+        const sha256Match = r.sourceSha256 && r.destinationSha256 && r.sourceSha256 === r.destinationSha256;
+        // Audit log: append-only file with transfer + result. Lets the user
+        // audit destructive remote transfers after the fact. Path:
+        // sandboxPaths().auditLog (atomic append via O_APPEND, mode 0600).
+        try {
+          const { envHash, sandboxRoot } = _auditMeta();
+          _writeAuditLog([
+            new Date().toISOString(),
+            envHash,
+            sandboxRoot,
+            "scp",
+            target.name,
+            target.remote,
+            params.direction,
+            `exit=${r.exitCode}`,
+            `${r.elapsedMs}ms`,
+            `src=${r.sourceSha256}`,
+            `dst=${r.destinationSha256}`,
+            `match=${sha256Match ? "yes" : "no"}`,
+            JSON.stringify(params.source),
+            "->",
+            JSON.stringify(params.destination)
+          ]);
+        } catch { /* audit failures must not break tool */ }
+        const parts = [];
+        // Surface the actual scp command in the result so debugging is
+        // trivial: copy-paste the scp line and it works.
+        parts.push(`$ scp ${r.args.join(" ")}`);
+        if (r.exitCode !== 0) {
+          parts.push(`[scp ${direction} failed exit=${r.exitCode}]`);
+          // scp emits diagnostics on stderr ('debug1: ...', 'scp: No such
+          // file...'). Always surface stderr in failure cases so the agent
+          // sees the actual error instead of a generic exit-code message.
+          if (r.stderr.length) {
+            const stderrText = r.stderr.toString("utf8").trimEnd();
+            // Keep stderr to last ~4KB to avoid flooding output
+            const tail = stderrText.length > 4096
+              ? "…\n" + stderrText.slice(stderrText.length - 4096)
+              : stderrText;
+            parts.push(tail);
+          }
+        } else {
+          parts.push(`scp ${params.direction} ok  ${r.elapsedMs}ms`);
+          // Speed/progress from scp -v summary line. Falls back gracefully
+          // if scp didn't emit the line (older versions or no -v flag).
+          if (r.sentBytes !== null && r.receivedBytes !== null) {
+            parts.push(`bytes  sent=${r.sentBytes}  received=${r.receivedBytes}`);
+          }
+          if (r.sentBps !== null && r.receivedBps !== null) {
+            parts.push(`speed  sent=${r.sentBps.toFixed(0)}B/s  received=${r.receivedBps.toFixed(0)}B/s`);
+          }
+          if (r.elapsedSec !== null) {
+            parts.push(`time   ${r.elapsedSec.toFixed(2)}s`);
+          }
+          if (r.sourceSha256 && r.destinationSha256) {
+            parts.push(`sha256  src=${r.sourceSha256.slice(0,12)}  dst=${r.destinationSha256.slice(0,12)}  ${sha256Match ? "MATCH" : "MISMATCH"}`);
           }
         }
-        if (r.truncated) parts.push(`[output truncated — exceeds 10MB cap]`);
-      }
-      return {
-        content: [{ type: "text", text: parts.join("\n") }],
-        details: {
-          ok: r.exitCode === 0,
-          direction: params.direction,
-          source: params.source,
-          destination: params.destination,
-          host: target.remote,
-          elapsed_ms: r.elapsedMs,
-          sent_bytes: r.sentBytes,
-          received_bytes: r.receivedBytes,
-          sent_bps: r.sentBps,
-          received_bps: r.receivedBps,
-          transfer_time_seconds: r.elapsedSec,
-          file_size_bytes: fileSizeBytes,
-          avg_speed_bps: r.elapsedSec > 0 && r.sentBytes > 0 ? Math.round(r.sentBytes / r.elapsedSec) : null,
-          sha256_match: sha256Match,
-          sha256_source: r.sourceSha256,
-          sha256_destination: r.destinationSha256
-        }
-      };
+        return {
+          content: [{ type: "text", text: parts.join("\n") }],
+          details: {
+            ok: r.exitCode === 0,
+            exit: r.exitCode,
+            elapsedMs: r.elapsedMs,
+            sourceSha256: r.sourceSha256,
+            destinationSha256: r.destinationSha256,
+            match: sha256Match,
+            direction: params.direction
+          }
+        };
+      });
     },
     renderCall(args, second, third) {
       const theme = _pickTheme(second, third, second);
@@ -2074,7 +2511,7 @@ function sshToolsExtension(pi) {
     renderResult(result, _options, theme) {
       const text = result?.content?.[0]?.text ?? "";
       return new _piTui.Text(text, 0, 0);
-    }
+    },
   });
 
   // ---- /sshactivate command -------------------------------------------
