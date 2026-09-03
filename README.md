@@ -159,8 +159,15 @@ Resolution order:
 3. `~/.ssh/config` `Host <arg>` block
 4. Raw `<arg>` passed to ssh(1) as a fallback
 
-### 4. Inline cwd via `name:/path` syntax
+   An optional `user@` prefix may be added to any of the above
+   inputs (e.g. `ssh_target_select pcadmin@web01`,
+   `/sshactivate root@pve-docker`). The user part must be a plain
+   username (`[A-Za-z0-9._-]+`); it is stripped before resolution
+   and wins over the user from `~/.ssh/config` / `profiles.json`.
+   IPv6 literals (which carry `:`) are left untouched so
+   `[user@::1]:22` is never mis-parsed.
 
+### 4. Inline cwd via `name:/path` syntax
 `/sshactivate web01:/etc/nginx` (convenience form) or
 `ssh_target_select web01:/etc/nginx` (agent-callable tool) override any
 stored cwd for this session. The inline path always wins.

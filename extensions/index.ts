@@ -859,7 +859,7 @@ function isSafeTargetString(s) {
 }
 
 function normalizeTargetArg(arg) {
-  const trimmed = (arg || "").trim();
+  let trimmed = (arg || "").trim();
   if (!trimmed) return { name: "", remote: "", cwd: undefined, untrusted: true, error: "empty target" };
   if (!isSafeTargetString(trimmed)) {
     return {
@@ -869,6 +869,34 @@ function normalizeTargetArg(arg) {
       untrusted: true,
       error: `target '${trimmed.slice(0, 60)}' contains unsafe characters (allowed: A-Z a-z 0-9 . _ @ - / :)`,
     };
+  }
+
+  // Strip an optional user@ prefix so callers can write
+  // "pcadmin@pcai-worker-node" as a shortcut. The user part must
+  // already have passed isSafeTargetString above (which allows @),
+  // and we additionally validate the user portion is a plain
+  // username to keep profile-name prompt-injection out. IPv6
+  // literals like "[::1]:22" carry a colon — when a colon is
+  // present we skip the split so we never mis-parse "[user@::1]"
+  // into user="user", host="::1".
+  let userPrefix: string | undefined;
+  if (!trimmed.includes(":")) {
+    const atIdx = trimmed.indexOf("@");
+    if (atIdx > 0 && atIdx < trimmed.length - 1) {
+      const candidate = trimmed.slice(0, atIdx);
+      if (/^[A-Za-z0-9._-]+$/.test(candidate)) {
+        userPrefix = candidate;
+        trimmed = trimmed.slice(atIdx + 1);
+      } else {
+        return {
+          name: trimmed,
+          remote: "",
+          cwd: undefined,
+          untrusted: true,
+          error: `user prefix '${candidate.slice(0, 40)}' contains unsafe characters`,
+        };
+      }
+    }
   }
 
   const data = readProfiles();
@@ -963,7 +991,7 @@ function normalizeTargetArg(arg) {
   // an unsafe cwd, drop it.
   if (cwd && !isSafeTargetString(cwd)) cwd = undefined;
 
-  const result = { name: resolved, remote, cwd, untrusted: false, sshConfigAlias };
+  const result = { name: resolved, remote, cwd, untrusted: false, sshConfigAlias, user: userPrefix };
   if (_sshTrace) result._sshTrace = _sshTrace;
   return result;
 }
@@ -1928,9 +1956,15 @@ function sshToolsExtension(pi) {
     if (profile.port) resolvedPort = profile.port;
 
     // 2) ssh -G — fills gaps when profile.* didn't set the field.
-    if (profile.sshConfigAlias && (!resolvedUser || !resolvedIdentityFile || !resolvedPort)) {
+    //    Activated for both profiles.json aliases (sshConfigAlias) AND
+    //    pure ssh-config matches (profile.name) so that a target like
+    //    "pcadmin@pcai-worker-node" — which matches the Host block
+    //    `pcai-worker-node` but NOT any profile — still picks up the
+    //    ssh-config User / Port / IdentityFile.
+    const aliasOrName = profile.sshConfigAlias || profile.name;
+    if (aliasOrName && (!resolvedUser || !resolvedIdentityFile || !resolvedPort)) {
       try {
-        const r = _nodeChild_process.spawnSync("ssh", ["-G", profile.sshConfigAlias, "-F", sandboxPaths().sshConfig], { encoding: "utf8", timeout: 5000 });
+        const r = _nodeChild_process.spawnSync("ssh", ["-G", aliasOrName, "-F", sandboxPaths().sshConfig], { encoding: "utf8", timeout: 5000 });
         if (r.status === 0) {
           const lines = r.stdout.split("\n").reduce((acc, l) => {
             const kv = l.trim().split(/\s+/);
@@ -1948,19 +1982,20 @@ function sshToolsExtension(pi) {
     }
 
     // 3) parseSshConfigProfiles() — final fallback for any remaining gaps.
-    if (profile.sshConfigAlias && (!resolvedUser || !resolvedIdentityFile || !resolvedPort)) {
-      const parsed = parseSshConfigProfiles().find(p => p.name === profile.sshConfigAlias);
+    //    Same expansion as step 2 so pure ssh-config matches still see
+    //    their IdentityFile / User / Port when ssh -G is unavailable.
+    if (aliasOrName && (!resolvedUser || !resolvedIdentityFile || !resolvedPort)) {
+      const parsed = parseSshConfigProfiles().find(p => p.name === aliasOrName);
       if (parsed) {
         if (!resolvedUser)          resolvedUser          = parsed.user;
         if (!resolvedIdentityFile) resolvedIdentityFile  = parsed.identityFile;
         if (!resolvedPort)         resolvedPort          = parsed.port;
       }
     }
-
-    ctx.ui.notify(`[ssh-ts] probe START remote=${profile.remote} alias=${profile.sshConfigAlias || "-"}`, "info");
+    ctx.ui.notify(`[ssh-ts] probe START remote=${profile.remote} alias=${profile.sshConfigAlias || profile.name || "-"}`, "info");
     if (profile._sshTrace) ctx.ui.notify(profile._sshTrace, "info");
     const probeStart = Date.now();
-    const r = await probe(profile.remote, undefined, profile.sshConfigAlias, {
+    const r = await probe(profile.remote, undefined, profile.sshConfigAlias || profile.name, {
       user: resolvedUser,
       identityFile: resolvedIdentityFile,
       port: resolvedPort,
