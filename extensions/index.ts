@@ -20,12 +20,13 @@ const SSH_STATUS_KEY = "ssh-tools";
 const SSH_TOOL_NAMES = ["ssh_target_select", "ssh_read", "ssh_write", "ssh_edit", "ssh_bash", "ssh_scp"];
 const SSH_CONFIG_PATH = _nodePath.join(_nodeOs.homedir(), ".ssh", "config");
 const PROFILES_FILE = _nodePath.join(_nodeOs.homedir(), ".config", "agent-ssh-tools", "profiles.json");
-const DEFAULT_PROBE_SECONDS = 6;
+const DEFAULT_PROBE_SECONDS = 8; // bumped from 6: gives the agent-bootstrap path enough slack on slow CI runners
 const DEFAULT_SSH_TIMEOUT_SECONDS = 30;
 const DEFAULT_SCP_TIMEOUT_SECONDS = 600;
 const DEFAULT_EXPECTED_SCP_THROUGHPUT_BPS = 12_500_000; // 12 MB/s — reasonable WAN estimate
 const DEFAULT_SCP_BUFFER_SECONDS = 60;
-
+const BOOTSTRAP_LOG_PATH = _nodePath.join(_nodeOs.homedir(), ".config", "agent-ssh-tools", "agent-bootstrap.log");
+const FALLBACK_IDENTITY_FILES = ["~/.ssh/id_ed25519", "~/.ssh/id_rsa", "~/.ssh/HPE_Pvt_key"];
 // omp's renderCallback signature is (args, options, theme); upstream pi is
 // (args, theme, context). Sniff the 2nd arg: if it has a .fg() method it's
 // the theme, otherwise it's the options object and the theme is the 3rd.
@@ -36,6 +37,200 @@ function _pickTheme(a, b, c) {
   return _isTheme(a) ? a : (_isTheme(b) ? b : c);
 }
 
+
+
+// ---- ssh agent bootstrap ----------------------------------------------
+
+// Append a one-line timestamped entry to ~/.config/agent-ssh-tools/agent-bootstrap.log.
+// Never throws — logging failures must never break the SSH path.
+function bootstrapDebug(msg) {
+  try {
+    _nodeFs.mkdirSync(_nodePath.dirname(BOOTSTRAP_LOG_PATH), { recursive: true });
+    const stamp = new Date().toISOString();
+    _nodeFs.appendFileSync(BOOTSTRAP_LOG_PATH, `[${stamp}] ${msg}\n`, { mode: 0o600 });
+  } catch { /* ignore */ }
+}
+
+// Probe the current SSH_AUTH_SOCK: synchronous, returns whether the agent
+// responds AND whether it has at least one identity. The agent's response
+// to `ssh-add -l` distinguishes "agent alive but empty" from "no agent".
+function sshAgentAlive() {
+  const sock = process.env.SSH_AUTH_SOCK;
+  if (!sock) return { alive: false, identities: 0, sock: "", reason: "SSH_AUTH_SOCK unset" };
+  if (!_nodeFs.existsSync(sock)) return { alive: false, identities: 0, sock, reason: "socket missing" };
+  const r = _nodeChild_process.spawnSync("ssh-add", ["-l"], {
+    encoding: "utf8", timeout: 3000,
+  });
+  if (r.error) return { alive: false, identities: 0, sock, reason: `ssh-add error: ${r.error.message}` };
+  if (r.status === 0) {
+    const lines = r.stdout.split("\n").filter(Boolean);
+    return { alive: true, identities: lines.length, sock, reason: "" };
+  }
+  // Non-zero exit: ssh-add prints "The agent has no identities." on stderr
+  // when alive-but-empty. Treat alive=true with identities=0 so callers can
+  // try to add a key.
+  const errOut = (r.stderr || "") + (r.stdout || "");
+  if (/no identities/i.test(errOut)) {
+    return { alive: true, identities: 0, sock, reason: "" };
+  }
+  return { alive: false, identities: 0, sock, reason: `ssh-add exit ${r.status}: ${errOut.split("\n")[0]}` };
+}
+
+// Start a fresh ssh-agent. Parses the `SSH_AUTH_SOCK=...; export ...;` lines
+// from `ssh-agent -s` (POSIX shell syntax). Returns the env vars to set or
+// null on failure. Never throws.
+function startSshAgent() {
+  const r = _nodeChild_process.spawnSync("ssh-agent", ["-s"], {
+    encoding: "utf8", timeout: 5000,
+  });
+  if (r.error || r.status !== 0) {
+    bootstrapDebug(`startSshAgent: failed (${r.error?.message || "exit " + r.status})`);
+    return null;
+  }
+  const out = r.stdout || "";
+  let sock = "";
+  let pid = "";
+  for (const line of out.split("\n")) {
+    const sockMatch = line.match(/SSH_AUTH_SOCK=([^;]+?);/);
+    if (sockMatch) sock = sockMatch[1].trim();
+    const pidMatch  = line.match(/SSH_AGENT_PID=([^;]+?);/);
+    if (pidMatch)  pid  = pidMatch[1].trim();
+  }
+  if (!sock || !pid) {
+    bootstrapDebug(`startSshAgent: could not parse export lines from:\n${out}`);
+    return null;
+  }
+  return { sock, pid };
+}
+
+// Try to add a single key. Returns { ok, reason }. Passphrase-protected keys
+// fail with a non-zero exit; we treat that as "skip, try next" and never
+// block on a missing pinentry. STDIN is closed immediately to prevent
+// ssh-add from waiting for a passphrase on the terminal.
+function sshAddKey(keyPath) {
+  const r = _nodeChild_process.spawnSync("ssh-add", [keyPath], {
+    encoding: "utf8", timeout: 5000,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (r.status === 0) return { ok: true, reason: "" };
+  const errOut = ((r.stderr || "") + " " + (r.stdout || "")).trim();
+  const reason = /passphrase|Permission denied|askpass/i.test(errOut)
+    ? `passphrase-protected (${errOut.split("\n")[0]})`
+    : `ssh-add failed (${errOut.split("\n")[0]})`;
+  return { ok: false, reason };
+}
+
+// Resolve the IdentityFile ssh would use for `aliasOrHost` (via `ssh -G`).
+// Falls back to the direct ~/.ssh/config parse when ssh -G is unavailable.
+function resolveIdentityFileForAlias(aliasOrHost) {
+  if (aliasOrHost && typeof aliasOrHost === "string") {
+    try {
+      const r = _nodeChild_process.spawnSync("ssh", ["-G", aliasOrHost], {
+        encoding: "utf8", timeout: 4000,
+      });
+      if (r.status === 0) {
+        for (const line of (r.stdout || "").split("\n")) {
+          const m = line.match(/^identityfile\s+(.+)$/i);
+          if (m) {
+            let p = m[1].trim();
+            if (p.startsWith("~")) p = _nodeOs.homedir() + p.slice(1);
+            if (_nodeFs.existsSync(p)) return p;
+          }
+        }
+      }
+    } catch { /* fall through */ }
+    // Fallback to direct parser when ssh -G is missing fields.
+    const direct = parseSshConfigProfiles().find(p => p.name === aliasOrHost);
+    if (direct?.identityFile && _nodeFs.existsSync(direct.identityFile)) return direct.identityFile;
+  }
+  // Hardcoded fallbacks (first existing match).
+  for (const candidate of FALLBACK_IDENTITY_FILES) {
+    const p = candidate.startsWith("~") ? _nodeOs.homedir() + candidate.slice(1) : candidate;
+    if (_nodeFs.existsSync(p)) return p;
+  }
+  return "";
+}
+
+// resolveSshAgent: makes sure SSH_AUTH_SOCK points at a working agent with
+// at least one identity. Three-step pipeline (each idempotent):
+//   1. If SSH_AUTH_SOCK is set AND the agent has identities: done.
+//   2. Otherwise start `ssh-agent -s`, set env, retry ssh-add -l.
+//   3. ssh-add IdentityFile from ssh-config (or hardcoded fallback list),
+//      skipping passphrase-protected keys. Returns { ok, sock, tried }.
+//
+// Mutates process.env.SSH_AUTH_SOCK / SSH_AGENT_PID so every subsequent
+// spawn picks them up via the explicit env object we pass (see buildSshEnv).
+// Cached by resolved sock path so re-entrant calls don't re-add the same key.
+let _bootstrapDoneForSock = "";
+function resolveSshAgent(opts) {
+  opts = opts || {};
+  const aliasOrHost = opts.sshConfigAlias || opts.alias || opts.host || "";
+  const existing = sshAgentAlive();
+  if (existing.alive && existing.identities > 0) {
+    _bootstrapDoneForSock = existing.sock;
+    bootstrapDebug(`resolveSshAgent: agent alive sock=${existing.sock} identities=${existing.identities}`);
+    return { ok: true, sock: existing.sock, pid: process.env.SSH_AGENT_PID || "", tried: [] };
+  }
+  if (_bootstrapDoneForSock && _bootstrapDoneForSock === (process.env.SSH_AUTH_SOCK || "") && existing.alive) {
+    // Idempotent: already bootstrapped against the same sock this turn.
+    return { ok: existing.identities > 0, sock: process.env.SSH_AUTH_SOCK || "", pid: process.env.SSH_AGENT_PID || "", tried: [] };
+  }
+  bootstrapDebug(`resolveSshAgent: starting ssh-agent (was alive=${existing.alive}, identities=${existing.identities}, reason=${existing.reason})`);
+  const started = startSshAgent();
+  if (!started) {
+    bootstrapDebug("resolveSshAgent: ssh-agent -s failed to start");
+    return { ok: false, sock: process.env.SSH_AUTH_SOCK || "", pid: "", tried: [], reason: "ssh-agent failed to start" };
+  }
+  process.env.SSH_AUTH_SOCK = started.sock;
+  process.env.SSH_AGENT_PID = started.pid;
+  _bootstrapDoneForSock = started.sock;
+
+  const identityFile = resolveIdentityFileForAlias(aliasOrHost);
+  const tried = [];
+  if (identityFile) {
+    const r = sshAddKey(identityFile);
+    tried.push({ file: identityFile, ok: r.ok, reason: r.reason });
+    bootstrapDebug(`resolveSshAgent: ssh-add ${identityFile} ok=${r.ok} ${r.reason}`);
+  }
+  // If we still have no identities, try the fallback list (skip duplicates).
+  const after = sshAgentAlive();
+  if (!after.alive || after.identities === 0) {
+    for (const candidate of FALLBACK_IDENTITY_FILES) {
+      const p = candidate.startsWith("~") ? _nodeOs.homedir() + candidate.slice(1) : candidate;
+      if (p === identityFile) continue;
+      if (!_nodeFs.existsSync(p)) continue;
+      const r = sshAddKey(p);
+      tried.push({ file: p, ok: r.ok, reason: r.reason });
+      bootstrapDebug(`resolveSshAgent: fallback ssh-add ${p} ok=${r.ok} ${r.reason}`);
+      const check = sshAgentAlive();
+      if (check.identities > 0) break;
+    }
+  }
+  const final = sshAgentAlive();
+  bootstrapDebug(`resolveSshAgent: done sock=${process.env.SSH_AUTH_SOCK} identities=${final.identities} tried=${tried.length}`);
+  return {
+    ok: final.identities > 0,
+    sock: process.env.SSH_AUTH_SOCK || "",
+    pid: process.env.SSH_AGENT_PID || "",
+    tried,
+    identityFile,
+  };
+}
+
+// Build the explicit env object passed to every ssh/scp child. We DO NOT
+// rely on process.env inheritance — sessions started by editors, CI
+// runners, or detached launchers often have a stripped env that hides
+// SSH_AUTH_SOCK and friends. Force them to current process.env values
+// (which resolveSshAgent has populated) so children always see them.
+function buildSshEnv() {
+  const env = { ...process.env };
+  if (process.env.SSH_AUTH_SOCK) env.SSH_AUTH_SOCK = process.env.SSH_AUTH_SOCK;
+  if (process.env.SSH_AGENT_PID) env.SSH_AGENT_PID = process.env.SSH_AGENT_PID;
+  if (process.env.HOME)         env.HOME         = process.env.HOME;
+  if (process.env.USER)         env.USER         = process.env.USER;
+  if (process.env.LOGNAME)      env.LOGNAME      = process.env.LOGNAME;
+  return env;
+}
 
 // ---- shell quoting -----------------------------------------------------
 
@@ -313,8 +508,12 @@ function sshCliAvailableTargets(): string {
 // sshExec: existing core wrapper. Keeps stdout/stderr separate; tools
 // can build their own verbose headers from these primitives.
 function sshExec(remote, command, options = {}) {
+  // Bootstrap the SSH agent if needed (no-op when env is already good).
+  // Runs once per process — cached internally. Synchronous on purpose:
+  // ssh-agent startup is sub-second and we want subsequent calls to see
+  // the populated env. Logged via bootstrapDebug().
+  resolveSshAgent({ sshConfigAlias: remote });
   return new Promise((resolve, reject) => {
-    // Always enforce key-only auth to prevent ssh_askpass hang on wrong user/key.
     const args = [
       "-o", "BatchMode=yes",
       "-o", "PreferredAuthentications=publickey"
@@ -328,7 +527,8 @@ function sshExec(remote, command, options = {}) {
     args.push(remote, command);
 
     const child = _nodeChild_process.spawn("ssh", args, {
-      stdio: ["pipe", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"],
+      env: buildSshEnv()
     });
 
     const stdoutChunks = [];
@@ -484,6 +684,9 @@ async function sshOk(remote, command, options = {}) {
 // alias is resolved via `ssh -G <alias>` instead of a DNS lookup. This
 // bypasses DNS for ~/.ssh/config Host aliases that have no DNS record.
 async function probe(remote, seconds = DEFAULT_PROBE_SECONDS, sshConfigAlias?: string, overrides?: { user?: string; identityFile?: string; port?: number }) {
+  // Bootstrap the SSH agent if needed. Idempotent and cached; safe to call
+  // from both probe() and sshExec() — the second call is a fast no-op.
+  resolveSshAgent({ sshConfigAlias });
   let ip: string;
   let resolvedUser: string | undefined;
   let resolvedPort: number;
@@ -601,7 +804,7 @@ async function probe(remote, seconds = DEFAULT_PROBE_SECONDS, sshConfigAlias?: s
     ip, "whoami"
   ];
   return new Promise(resolve => {
-    const proc = _nodeChild_process.spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
+    const proc = _nodeChild_process.spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"], env: buildSshEnv() });
     let stdout = "", stderr = "";
     let killed = false;
     const killTimer = setTimeout(() => {
@@ -891,7 +1094,7 @@ async function scpTransfer(target, direction, source, destination, recursive, ti
   }
   return new Promise((resolve) => {
     const t0 = Date.now();
-    const child = _nodeChild_process.spawn("scp", args, { stdio: ["pipe", "pipe", "pipe"] });
+    const child = _nodeChild_process.spawn("scp", args, { stdio: ["pipe", "pipe", "pipe"], env: buildSshEnv() });
     const liveStartMs = Date.now();
     const liveEnabled = process.platform === "linux" && typeof onUpdate === "function" && typeof fileSizeBytes === "number" && fileSizeBytes > 0;
     let liveTimer: any = null;
