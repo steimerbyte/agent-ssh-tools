@@ -205,6 +205,62 @@ remote cwd**, not the local process cwd. Matches the intuition: "I said
 | `SSH_CLI_AUTO_ACTIVATE=1` (env) | Auto-enable SSH tools at session start so the agent can use them without typing `/sshactivate`. The target still has to be picked via `ssh_target_select` (probe + verify run as usual). `/sshactivate off` overrides. |
 | `--ssh-activate` (CLI flag) | Same effect as the env var; passed to `pi`/`omp` at startup. |
 
+## SSH agent bootstrap
+
+Before every `ssh` / `scp` child process the extension makes sure
+`SSH_AUTH_SOCK` points at a working agent with at least one identity
+loaded. The pipeline runs three steps in order and stops at the first
+success:
+
+1. **Read inherited env.** If `SSH_AUTH_SOCK` is set and `ssh-add -l`
+   reports at least one identity, the existing agent is used as-is. No
+   new process is spawned.
+2. **Auto-start `ssh-agent -s`.** When the inherited env is missing,
+   empty, or points at a dead socket, the extension starts a fresh
+   `ssh-agent -s`, parses its `SSH_AUTH_SOCK=…; export SSH_AGENT_PID=…;`
+   lines, and writes both vars into `process.env` so subsequent
+   children see them.
+3. **Add an identity.** The extension resolves an `IdentityFile` from
+   `ssh -G <host>` (falling back to `~/.ssh/config` direct parse), then
+   `ssh-add`s it. Hardcoded fallbacks are tried in order if the resolved
+   key cannot be added (e.g. passphrase-protected, file missing):
+   `~/.ssh/id_ed25519` → `~/.ssh/id_rsa` → `~/.ssh/HPE_Pvt_key`.
+   Passphrase failures are caught and skipped, never blocking on a
+   missing pinentry.
+
+Every `ssh` / `scp` spawn is passed an `env` object that explicitly
+includes `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `HOME`, `USER`, and `LOGNAME`.
+That keeps the agent socket reachable even when the parent shell that
+launched `omp` had a stripped env (editors, CI runners, detached
+launchers).
+
+### Env override
+
+| Variable | Effect |
+|----------|--------|
+| `SSH_AUTH_SOCK` | Standard ssh-agent socket path. The extension never overrides this when it already points at a working agent. |
+| `SSH_AGENT_PID` | Standard ssh-agent PID. Same — kept in sync if the extension had to start its own agent. |
+
+### Debug log
+
+Every bootstrap step appends one line to
+`~/.config/agent-ssh-tools/agent-bootstrap.log` with the resolved socket,
+key tried, and final identity count. Tail it to diagnose
+"authentication failed" reports:
+
+```sh
+tail -f ~/.config/agent-ssh-tools/agent-bootstrap.log
+```
+
+### Post-quantum key exchange warning is cosmetic
+
+OpenSSH 9+ prints a `** WARNING: connection is not using a
+post-quantum key exchange algorithm.` banner when neither side offers
+the hybrid ML-KEM / Curve25519 kex. That banner does NOT mean
+authentication failed — the connection still authenticates with the
+classical algorithm. Look at the extension's notify output and the
+`agent-bootstrap.log` for the real auth error when a probe fails.
+
 ## Credits
 
 The original `pi-ssh-tools` plugin — including the four-tool pattern of
