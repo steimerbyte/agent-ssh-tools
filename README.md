@@ -338,6 +338,8 @@ verändert oder gelöscht.
    - `~/.ssh/known_hosts` → `$AGENT_SSH_ROOT/ssh/known_hosts`
    - alle in `profiles.json` referenzierten `IdentityFile`-Pfade →
      `$AGENT_SSH_ROOT/ssh/identity/<basename>`
+   - `~/.config/agent-ssh-tools/profiles.json` →
+     `$AGENT_SSH_ROOT/state/profiles.json`
    ```sh
    AGENT_SSH_IMPORT_FROM_HOME=1 omp
    ```

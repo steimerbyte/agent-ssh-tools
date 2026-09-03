@@ -200,6 +200,15 @@ async function migrateFromHome() {
       _tryCopy(expanded, _nodePath.join(p.sshIdentityDir, base));
     }
 
+    // 4. profiles.json — lives under ~/.config/agent-ssh-tools/, not
+    // ~/.ssh/. The sandbox copy is the source of truth for both
+    // ssh_target_select's profile resolution and the identityFile
+    // paths the migration step above just consumed. _tryCopy returns
+    // null silently when the source is absent, so a fresh install
+    // without a prior profiles.json is a no-op.
+    const oldProfilesPath = _nodePath.join(_nodeOs.homedir(), ".config", "agent-ssh-tools", "profiles.json");
+    _tryCopy(oldProfilesPath, p.profilesFile);
+
     bootstrapDebug(`migration: imported ${imported} files from $HOME/.ssh/ (skipped ${skipped})`);
     return true;
   } catch (err) {
