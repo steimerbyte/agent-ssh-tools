@@ -14,6 +14,48 @@ import * as _nodeCrypto from "node:crypto";
 import * as _piCodingAgent from "@earendil-works/pi-coding-agent";
 import * as _piTui from "@earendil-works/pi-tui";
 
+// ---- post-quantum warning helpers -------------------------------------
+
+// Modern OpenSSH (>= 9.x) prints a 3-line cosmetic warning on stderr when
+// the negotiated KEX is NOT post-quantum ("WARNING: connection is not using
+// a post-quantum key exchange algorithm.", "store now, decrypt later",
+// "pq.html"). The connection still succeeds — it is purely informational.
+// We must strip these lines BEFORE classifying ssh stderr as auth/timeout/
+// refused/etc., otherwise a clean login can be misclassified as an auth
+// failure. The three patterns cover every line OpenSSH emits in the warning
+// block on every version seen in the wild.
+const PQ_WARNING_PATTERNS: RegExp[] = [
+  /post-quantum key exchange/i,
+  /store now, decrypt later/i,
+  /pq\.html/i,
+];
+function isPostQuantumWarning(line: string): boolean {
+  return PQ_WARNING_PATTERNS.some(re => re.test(line));
+}
+// Strip any line whose content matches an OpenSSH post-quantum warning.
+// Returns "" when every line was a warning. Collapses runs of blank lines
+// the filter leaves behind so the surrounding stderr text reads naturally.
+function stripPqWarnings(stderr: string): string {
+  return stderr
+    .split("\n")
+    .filter(line => !isPostQuantumWarning(line))
+    .join("\n")
+    .replace(/\n{2,}/g, "\n")
+    .trim();
+}
+// Build a cosmetic note describing what was filtered, suitable for
+// appending to a user-facing detail string. Returns "" when nothing was
+// filtered so callers can blindly concatenate.
+function pqWarningNote(rawErr: string): string {
+  const filtered = rawErr
+    .split("\n")
+    .filter(line => isPostQuantumWarning(line))
+    .map(line => line.trim())
+    .filter(Boolean);
+  if (filtered.length === 0) return "";
+  return "[!] post-quantum warning (kosmetisch): " + filtered.join(" | ");
+}
+
 // ---- sandbox root + path resolver + migration helper --------------------
 
 // All persistent SSH data lives under $AGENT_SSH_ROOT (default
@@ -1100,14 +1142,25 @@ async function sshExecVerbose(remote, command, options = {}) {
     stderr = Buffer.from(String(e?.message ?? e));
   }
   const elapsed = Date.now() - t0;
-  const header = formatSshHeader(remote, command, exit, elapsed, stderr.toString("utf8").trim());
+  // Strip OpenSSH's cosmetic post-quantum warning before formatting the
+  // header so the agent doesn't see "stderr: WARNING: ... post-quantum ..."
+  // on a successful run. The raw stderr buffer is left untouched — callers
+  // that need the original bytes for auditing / debugging still get them.
+  const headerStderr = stripPqWarnings(stderr.toString("utf8").trim());
+  const header = formatSshHeader(remote, command, exit, elapsed, headerStderr);
   return { exit, stdout, stderr, elapsedMs: elapsed, truncated, header };
 }
 
 async function sshOk(remote, command, options = {}) {
   const { stdout, stderr, exitCode } = await sshExec(remote, command, options);
   if (exitCode !== 0) {
-    const msg = stderr.toString("utf8").trim() || stdout.toString("utf8").trim() || "unknown ssh error";
+    // Strip OpenSSH's cosmetic post-quantum warning from the error message
+    // so a failed real-command (e.g. "Permission denied (publickey).") doesn't
+    // get diluted by 3 lines of cosmetic noise. Fall back to stdout when
+    // stderr is empty after the filter.
+    const errText = stripPqWarnings(stderr.toString("utf8").trim());
+    const outText = stripPqWarnings(stdout.toString("utf8").trim());
+    const msg = errText || outText || "unknown ssh error";
     throw new Error(`SSH failed (${exitCode}): ${msg}`);
   }
   return stdout;
@@ -1257,17 +1310,23 @@ async function probe(remote, seconds = DEFAULT_PROBE_SECONDS, sshConfigAlias?: s
       if (killed) return;
       clearTimeout(killTimer);
       const out = stdout.trim();
-      const err = stderr.trim();
+      const rawErr = stderr.trim();
+      // Strip OpenSSH's cosmetic post-quantum warning lines from stderr
+      // BEFORE classifying — without this, a clean login that just happens
+      // to negotiate a non-PQ KEX can be misclassified as an auth failure.
+      const err = stripPqWarnings(rawErr);
+      const note = pqWarningNote(rawErr);
+      const append = (s: string) => note ? `${s}  ${note}` : s;
       if (code === 0 && out) return resolve({ ok: true, user: out, ip });
       if (/permission denied|publickey|password|authentic/i.test(err))
-        return resolve({ ok: false, reason: "auth", detail: err.split("\n")[0] || err, ip });
+        return resolve({ ok: false, reason: "auth", detail: append(err.split("\n")[0] || err), ip });
       if (/no such host|getaddrinfo|unknown host|name or service/i.test(err))
-        return resolve({ ok: false, reason: "unreachable", detail: err.split("\n")[0] || err, ip });
+        return resolve({ ok: false, reason: "unreachable", detail: append(err.split("\n")[0] || err), ip });
       if (/connection refused/i.test(err))
-        return resolve({ ok: false, reason: "refused", detail: err.split("\n")[0] || err, ip });
+        return resolve({ ok: false, reason: "refused", detail: append(err.split("\n")[0] || err), ip });
       if (/timed out|no route/i.test(err))
-        return resolve({ ok: false, reason: "unreachable", detail: err.split("\n")[0] || err, ip });
-      resolve({ ok: false, reason: "ssh-error", detail: err || `ssh exited ${code}`, ip });
+        return resolve({ ok: false, reason: "unreachable", detail: append(err.split("\n")[0] || err), ip });
+      resolve({ ok: false, reason: "ssh-error", detail: append(err || `ssh exited ${code}`), ip });
     });
     proc.on("error", e => {
       if (killed) return;
@@ -1618,8 +1677,12 @@ async function scpTransfer(target, direction, source, destination, recursive, ti
       clearTimeout(killTimer);
       if (killed) {
         if (liveTimer) clearInterval(liveTimer);
+        // Also strip OpenSSH's cosmetic post-quantum warning from the
+        // killed-path stderr buffer so the timeout message reaches the
+        // agent without 3 lines of cosmetic noise on top.
+        const killedStderr = Buffer.from(stripPqWarnings(Buffer.concat(errChunks).toString("utf8")), "utf8");
         resolve({
-          exitCode: 124, stdout: Buffer.concat(outChunks), stderr: Buffer.concat(errChunks),
+          exitCode: 124, stdout: Buffer.concat(outChunks), stderr: killedStderr,
           elapsedMs: Date.now() - t0, sourceSha256: "", destinationSha256: "", truncated: false, args
         });
         return;
@@ -1630,6 +1693,11 @@ async function scpTransfer(target, direction, source, destination, recursive, ti
       let truncated = false;
       if (stdout.length > outCap) { stdout = stdout.subarray(0, outCap); truncated = true; }
       if (stderr.length > outCap) { stderr = stderr.subarray(0, outCap); truncated = true; }
+      // Strip OpenSSH's cosmetic post-quantum warning lines from the final
+      // stderr buffer before handing it to the user-facing tool result.
+      // The raw progress / summary lines stay intact (they're emitted via
+      // stdout-style parsing during the run, not classified against stderr).
+      stderr = Buffer.from(stripPqWarnings(stderr.toString("utf8")), "utf8");
       // Compute SHA-256 of source + destination AFTER transfer so the
       // caller can verify integrity. Async fs operations.
       const srcSha = await sha256FileAsync(direction === "upload" ? source : destination);
